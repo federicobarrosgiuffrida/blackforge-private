@@ -302,6 +302,86 @@ __global__ void gqaForwardKernel(float* output, float* rowMax, float* rowSum, co
     }
 }
 
+// Stessa trasformazione del forward applicata al backward: una riga di query
+// per warp, 4 dimensioni per lane, riduzioni con farfalla invece che con
+// riduzione di blocco. Qui le riduzioni per chiave sono due (il prodotto
+// scalare e il gradiente sulla probabilita'), quindi il vecchio schema
+// pagava due __syncthreads e due giri in memoria condivisa per ogni coppia.
+//
+// Gli atomicAdd su gradKey e gradValue restano necessari perche' piu' righe
+// di query concorrono sulla stessa chiave, ma ora le lane di un warp
+// scrivono indirizzi consecutivi, quindi le transazioni sono coalescenti.
+__device__ __forceinline__ void warpAllSumPair(float& first, float& second) {
+    for (int offset = kCudaWarpSize / 2; offset > 0; offset >>= 1) {
+        first += __shfl_xor_sync(0xffffffffU, first, offset);
+        second += __shfl_xor_sync(0xffffffffU, second, offset);
+    }
+}
+
+__global__ __launch_bounds__(kWarpBlockThreads) void gqaBackward128WarpKernel(
+    float* gradQuery, float* gradKey, float* gradValue, const float* query, const float* key,
+    const float* value, const float* output, const float* gradOutput, const float* rowMax,
+    const float* rowSum, std::size_t batch, std::size_t seq, std::size_t heads,
+    std::size_t kvHeads, std::size_t headsPerGroup, float scale) {
+    const int warp = static_cast<int>(threadIdx.x) / kCudaWarpSize;
+    const int lane = static_cast<int>(threadIdx.x) % kCudaWarpSize;
+    const std::size_t row =
+        static_cast<std::size_t>(blockIdx.x) * kRowsPerWarpBlock + static_cast<std::size_t>(warp);
+    if (row >= batch * heads * seq) return;
+    const std::size_t queryPosition = row % seq;
+    const std::size_t head = (row / seq) % heads;
+    const std::size_t batchIndex = row / (seq * heads);
+    const std::size_t kvHead = head / headsPerGroup;
+    const std::size_t queryOffset = ((batchIndex * seq + queryPosition) * heads + head) * 128;
+
+    float queryValue[4];
+    float gradOutputValue[4];
+    float queryGradient[4];
+    float correctionPartial = 0.0F;
+#pragma unroll
+    for (int i = 0; i < 4; ++i) {
+        const std::size_t offset = queryOffset + lane + i * kCudaWarpSize;
+        queryValue[i] = query[offset];
+        gradOutputValue[i] = gradOutput[offset];
+        queryGradient[i] = 0.0F;
+        correctionPartial = fmaf(output[offset], gradOutputValue[i], correctionPartial);
+    }
+    const float correctionValue = warpAllSum(correctionPartial);
+    const float rowMaximum = rowMax[row];
+    const float rowTotal = rowSum[row];
+
+    for (std::size_t keyPosition = 0; keyPosition <= queryPosition; ++keyPosition) {
+        const std::size_t kvOffset = ((batchIndex * seq + keyPosition) * kvHeads + kvHead) * 128;
+        float keyValue[4];
+        float valueValue[4];
+        float dot = 0.0F;
+        float probabilityGradient = 0.0F;
+#pragma unroll
+        for (int i = 0; i < 4; ++i) {
+            const std::size_t offset = kvOffset + lane + i * kCudaWarpSize;
+            keyValue[i] = key[offset];
+            valueValue[i] = value[offset];
+            dot = fmaf(queryValue[i], keyValue[i], dot);
+            probabilityGradient = fmaf(gradOutputValue[i], valueValue[i], probabilityGradient);
+        }
+        warpAllSumPair(dot, probabilityGradient);
+        const float probability = expf(dot * scale - rowMaximum) / rowTotal;
+        const float gradScore = probability * (probabilityGradient - correctionValue) * scale;
+#pragma unroll
+        for (int i = 0; i < 4; ++i) {
+            const std::size_t offset = kvOffset + lane + i * kCudaWarpSize;
+            queryGradient[i] = fmaf(gradScore, keyValue[i], queryGradient[i]);
+            atomicAdd(gradKey + offset, gradScore * queryValue[i]);
+            atomicAdd(gradValue + offset, probability * gradOutputValue[i]);
+        }
+    }
+
+#pragma unroll
+    for (int i = 0; i < 4; ++i) {
+        gradQuery[queryOffset + lane + i * kCudaWarpSize] = queryGradient[i];
+    }
+}
+
 __global__ void gqaBackwardKernel(float* gradQuery, float* gradKey, float* gradValue,
                                   const float* query, const float* key, const float* value,
                                   const float* output, const float* gradOutput, const float* rowMax,
@@ -427,7 +507,8 @@ Tensor GqaAttention::backward(const Tensor& input, const Tensor& gradOutput, con
     const std::size_t rows = batch * config_.numHeads * seq;
     const float scale = 1.0F / std::sqrt(static_cast<float>(config_.headDim));
     if (config_.headDim == 128) {
-        gqaBackward128Kernel<<<static_cast<unsigned int>(rows), kHeadDim128Threads>>>(
+        const std::size_t warpBlocks = (rows + kRowsPerWarpBlock - 1) / kRowsPerWarpBlock;
+        gqaBackward128WarpKernel<<<static_cast<unsigned int>(warpBlocks), kWarpBlockThreads>>>(
             gradQuery.data(), gradKey.data(), gradValue.data(), cache.query.data(), cache.key.data(),
             cache.value.data(), cache.attnOutput.data(), gradAttnOutput.data(), cache.rowMax.data(),
             cache.rowSum.data(), batch, seq, config_.numHeads, config_.numKvHeads,
