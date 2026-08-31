@@ -117,6 +117,91 @@ __global__ __launch_bounds__(kHeadDim128Threads) void gqaForward128Kernel(
     }
 }
 
+// Il kernel per riga singola spende, per OGNI coppia (query, chiave), una
+// riduzione di blocco su 128 thread: due __syncthreads e un giro in memoria
+// condivisa per un solo prodotto scalare. Con seq=512 sono 2,5e7 riduzioni
+// per layer, ed e' li' che se ne va il tempo, non nei calcoli.
+//
+// Qui una riga di query e' posseduta da un WARP: ogni lane tiene 4 delle 128
+// dimensioni (lane, lane+32, lane+64, lane+96), il prodotto scalare si chiude
+// con una farfalla di __shfl_xor_sync che lascia la somma in tutte le lane, e
+// gli accumulatori su V restano nei registri della lane che li possiede.
+// Niente barriere, niente memoria condivisa: i 4 warp del blocco avanzano
+// indipendenti e coprono 4 righe di query invece di una.
+//
+// Gli accessi restano coalescenti: le lane 0..31 leggono indirizzi
+// consecutivi per ciascuno dei 4 blocchi di dimensioni.
+//
+// La ricorrenza del softmax online e' identica; cambia solo l'ordine di
+// somma dentro il prodotto scalare, quindi il risultato e' equivalente entro
+// la tolleranza in virgola mobile, non bit-identico.
+__device__ __forceinline__ float warpAllSum(float value) {
+    for (int offset = kCudaWarpSize / 2; offset > 0; offset >>= 1) {
+        value += __shfl_xor_sync(0xffffffffU, value, offset);
+    }
+    return value;
+}
+
+constexpr int kRowsPerWarpBlock = 4;
+constexpr int kWarpBlockThreads = kRowsPerWarpBlock * kCudaWarpSize;
+
+__global__ __launch_bounds__(kWarpBlockThreads) void gqaForward128WarpKernel(
+    float* output, float* rowMax, float* rowSum, const float* query, const float* key,
+    const float* value, std::size_t batch, std::size_t seq, std::size_t heads,
+    std::size_t kvHeads, std::size_t headsPerGroup, float scale) {
+    const int warp = static_cast<int>(threadIdx.x) / kCudaWarpSize;
+    const int lane = static_cast<int>(threadIdx.x) % kCudaWarpSize;
+    const std::size_t row =
+        static_cast<std::size_t>(blockIdx.x) * kRowsPerWarpBlock + static_cast<std::size_t>(warp);
+    if (row >= batch * heads * seq) return;
+    const std::size_t queryPosition = row % seq;
+    const std::size_t head = (row / seq) % heads;
+    const std::size_t batchIndex = row / (seq * heads);
+    const std::size_t kvHead = head / headsPerGroup;
+    const std::size_t queryOffset = ((batchIndex * seq + queryPosition) * heads + head) * 128;
+
+    float queryValue[4];
+    float accumulator[4];
+#pragma unroll
+    for (int i = 0; i < 4; ++i) {
+        queryValue[i] = query[queryOffset + lane + i * kCudaWarpSize];
+        accumulator[i] = 0.0F;
+    }
+
+    float runningMaximum = -3.402823466e+38F;
+    float runningTotal = 0.0F;
+    for (std::size_t keyPosition = 0; keyPosition <= queryPosition; ++keyPosition) {
+        const std::size_t kvOffset = ((batchIndex * seq + keyPosition) * kvHeads + kvHead) * 128;
+        float partial = 0.0F;
+        float valueValue[4];
+#pragma unroll
+        for (int i = 0; i < 4; ++i) {
+            partial = fmaf(queryValue[i], key[kvOffset + lane + i * kCudaWarpSize], partial);
+            valueValue[i] = value[kvOffset + lane + i * kCudaWarpSize];
+        }
+        const float score = warpAllSum(partial) * scale;
+        const float nextMaximum = fmaxf(runningMaximum, score);
+        const float correction =
+            runningMaximum == -3.402823466e+38F ? 0.0F : expf(runningMaximum - nextMaximum);
+        const float weight = expf(score - nextMaximum);
+        runningTotal = fmaf(runningTotal, correction, weight);
+        runningMaximum = nextMaximum;
+#pragma unroll
+        for (int i = 0; i < 4; ++i) {
+            accumulator[i] = fmaf(weight, valueValue[i], accumulator[i] * correction);
+        }
+    }
+
+#pragma unroll
+    for (int i = 0; i < 4; ++i) {
+        output[queryOffset + lane + i * kCudaWarpSize] = accumulator[i] / runningTotal;
+    }
+    if (lane == 0) {
+        rowMax[row] = runningMaximum;
+        rowSum[row] = runningTotal;
+    }
+}
+
 __global__ __launch_bounds__(kHeadDim128Threads) void gqaBackward128Kernel(
     float* gradQuery, float* gradKey, float* gradValue, const float* query, const float* key,
     const float* value, const float* output, const float* gradOutput, const float* rowMax,
@@ -316,7 +401,8 @@ Tensor GqaAttention::forward(const Tensor& input, AttentionCache& cache) const {
     const std::size_t rows = batch * config_.numHeads * seq;
     const float scale = 1.0F / std::sqrt(static_cast<float>(config_.headDim));
     if (config_.headDim == 128) {
-        gqaForward128Kernel<<<static_cast<unsigned int>(rows), kHeadDim128Threads>>>(
+        const std::size_t warpBlocks = (rows + kRowsPerWarpBlock - 1) / kRowsPerWarpBlock;
+        gqaForward128WarpKernel<<<static_cast<unsigned int>(warpBlocks), kWarpBlockThreads>>>(
             cache.attnOutput.data(), cache.rowMax.data(), cache.rowSum.data(), cache.query.data(),
             cache.key.data(), cache.value.data(), batch, seq, config_.numHeads, config_.numKvHeads,
             config_.headsPerKvGroup(), scale);
