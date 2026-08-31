@@ -34,8 +34,8 @@ unsigned int gridFor(std::size_t count) {
 
 __global__ void softmaxSmallKernel(float* probabilities, const float* logits, std::size_t tokens,
                                    std::size_t experts) {
-    const std::size_t token = blockIdx.x;
-    if (token >= tokens || threadIdx.x != 0) return;
+    const std::size_t token = static_cast<std::size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (token >= tokens) return;
     float maximum = logits[token * experts];
     for (std::size_t expert = 1; expert < experts; ++expert) {
         maximum = fmaxf(maximum, logits[token * experts + expert]);
@@ -285,8 +285,8 @@ __global__ void scatterAddKernel(float* output, const float* gathered, const int
 __global__ void softmaxBackwardSmallKernel(float* gradLogits, const float* probabilities,
                                            const float* gradProbabilities, std::size_t tokens,
                                            std::size_t experts) {
-    const std::size_t token = blockIdx.x;
-    if (token >= tokens || threadIdx.x != 0) return;
+    const std::size_t token = static_cast<std::size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (token >= tokens) return;
     double weighted = 0.0;
     for (std::size_t expert = 0; expert < experts; ++expert) {
         weighted += static_cast<double>(gradProbabilities[token * experts + expert]) *
@@ -353,7 +353,7 @@ Tensor MoELayer::forward(const Tensor& input, MoECache& cache, MoERoutingStats& 
     GpuProfiler::instance().begin(GpuPhase::Router);
     Tensor logits = denseLinear(input, routerWeight_);
     cache.probabilities = Tensor({tokens, config_.numExperts}, MemoryArena::MoeDispatch);
-    softmaxSmallKernel<<<static_cast<unsigned int>(tokens), 1>>>(
+    softmaxSmallKernel<<<gridFor(tokens), kBlockSize>>>(
         cache.probabilities.data(), logits.data(), tokens, config_.numExperts);
     cache.expertOfSlot = IndexTensor({slots}, MemoryArena::MoeDispatch);
     cache.weightOfSlot = Tensor::zeros({slots}, MemoryArena::MoeDispatch);
@@ -461,7 +461,7 @@ Tensor MoELayer::backward(const Tensor& input, const Tensor& gradOutput, const M
     }
     GpuProfiler::instance().begin(GpuPhase::Router);
     Tensor gradLogits({cache.tokens, config_.numExperts}, MemoryArena::MoeDispatch);
-    softmaxBackwardSmallKernel<<<static_cast<unsigned int>(cache.tokens), 1>>>(
+    softmaxBackwardSmallKernel<<<gridFor(cache.tokens), kBlockSize>>>(
         gradLogits.data(), cache.probabilities.data(), gradProbabilities.data(), cache.tokens,
         config_.numExperts);
     DenseLinearGrad routerGrad = denseLinearBackward(input, routerWeight_, gradLogits);

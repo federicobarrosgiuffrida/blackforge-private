@@ -35,8 +35,8 @@ __global__ void initializeHeadStatsKernel(float* rowMax, float* rowSum, float* t
 __global__ void updateHeadStatsKernel(float* rowMax, float* rowSum, float* targetLogit,
                                       const float* logits, const int* targets, std::size_t tokens,
                                       std::size_t firstVocabulary, std::size_t count) {
-    const std::size_t token = blockIdx.x;
-    if (token >= tokens || threadIdx.x != 0 || targets[token] < 0) return;
+    const std::size_t token = static_cast<std::size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (token >= tokens || targets[token] < 0) return;
     float maximum = rowMax[token];
     float total = rowSum[token];
     for (std::size_t column = 0; column < count; ++column) {
@@ -253,7 +253,7 @@ BlackBitStepResult BlackBitModel::trainStep(const std::vector<int>& tokenIds,
     for (std::size_t first = 0; first < config_.vocabSize; first += chunk) {
         const std::size_t count = std::min(chunk, config_.vocabSize - first);
         Tensor logits = embedding_.forwardRows(finalHidden, first, count);
-        updateHeadStatsKernel<<<static_cast<unsigned int>(tokens), 1>>>(
+        updateHeadStatsKernel<<<gridFor(tokens), kBlockSize>>>(
             rowMax.data(), rowSum.data(), targetLogit.data(), logits.data(), deviceTargets.data(), tokens,
             first, count);
     }
