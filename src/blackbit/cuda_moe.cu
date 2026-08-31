@@ -50,22 +50,65 @@ __global__ void softmaxSmallKernel(float* probabilities, const float* logits, st
     }
 }
 
-// Intentionally one deterministic GPU thread. Routing is O(tokens * experts),
-// at most a few thousand comparisons, and this preserves the CPU tie-breaking
-// and capacity semantics while all expert compute remains in large GPU GEMMs.
+// Massa di probabilita' ed entropia non dipendono dalle assegnazioni:
+// si calcolano dalle sole probabilita', quindi non c'e' motivo di
+// tenerle nel kernel sequenziale. Erano tokens * experts logaritmi in
+// doppia precisione su UN thread — 4096 per layer a seq 512, e il
+// profilo dava routeForwardKernel a 229 ms/step per questo.
+//
+// Il gradiente della loss di bilanciamento si calcola dai CONTEGGI (vedi
+// routingGradientKernel), non da questa massa: qui cambia solo l'ordine
+// di accumulazione di due valori riportati.
+__global__ void routingStatsKernel(const float* probabilities, RoutingSummary* summary, std::size_t tokens,
+                                   std::size_t experts) {
+    __shared__ float sharedMass[kMaximumExperts];
+    __shared__ double sharedEntropy[kBlockSize / 32];
+    if (threadIdx.x < experts) sharedMass[threadIdx.x] = 0.0F;
+    __syncthreads();
+
+    double localEntropy = 0.0;
+    const std::size_t stride = static_cast<std::size_t>(gridDim.x) * blockDim.x;
+    for (std::size_t token = static_cast<std::size_t>(blockIdx.x) * blockDim.x + threadIdx.x; token < tokens;
+         token += stride) {
+        const float* row = probabilities + token * experts;
+        for (std::size_t expert = 0; expert < experts; ++expert) {
+            const float value = row[expert];
+            atomicAdd(&sharedMass[expert], value);
+            if (value > 0.0F) localEntropy -= static_cast<double>(value) * log(static_cast<double>(value));
+        }
+    }
+
+    constexpr unsigned int kFullMask = 0xFFFFFFFFU;
+    for (int offset = 16; offset > 0; offset >>= 1) {
+        localEntropy += __shfl_down_sync(kFullMask, localEntropy, offset);
+    }
+    const int warp = static_cast<int>(threadIdx.x) / 32;
+    const int lane = static_cast<int>(threadIdx.x) % 32;
+    if (lane == 0) sharedEntropy[warp] = localEntropy;
+    __syncthreads();
+
+    if (threadIdx.x < experts && sharedMass[threadIdx.x] != 0.0F) {
+        atomicAdd(&summary->probabilityMass[threadIdx.x], sharedMass[threadIdx.x]);
+    }
+    if (threadIdx.x == 0) {
+        double blockEntropy = 0.0;
+        for (int w = 0; w < static_cast<int>(kBlockSize / 32); ++w) blockEntropy += sharedEntropy[w];
+        if (blockEntropy != 0.0) atomicAdd(&summary->entropySum, blockEntropy);
+    }
+}
+
+// Intentionally one deterministic GPU thread. La selezione greedy riempie
+// la capacita' in ordine di token, quindi e' sequenziale per costruzione:
+// parallelizzarla cambierebbe QUALI esperti vengono scelti. Qui resta solo
+// quella, senza piu' logaritmi ne' accumulazioni diagnostiche.
 __global__ void routeForwardKernel(const float* probabilities, int* expertOfSlot, float* weightOfSlot,
                                    int* tokensOfExpert, int* slotsOfExpert, int* counts,
                                    RoutingSummary* summary, std::size_t tokens,
                                    std::size_t experts, std::size_t topK, std::size_t capacity) {
     if (blockIdx.x != 0 || threadIdx.x != 0) return;
-    double entropy = 0.0;
     unsigned long long droppedCount = 0;
     for (std::size_t token = 0; token < tokens; ++token) {
         const float* row = probabilities + token * experts;
-        for (std::size_t expert = 0; expert < experts; ++expert) {
-            summary->probabilityMass[expert] += row[expert];
-            if (row[expert] > 0.0F) entropy -= static_cast<double>(row[expert]) * log(static_cast<double>(row[expert]));
-        }
         std::uint32_t selected = 0;
         float selectedMass = 0.0F;
         for (std::size_t slot = 0; slot < topK; ++slot) {
@@ -99,7 +142,6 @@ __global__ void routeForwardKernel(const float* probabilities, int* expertOfSlot
         }
     }
     for (std::size_t expert = 0; expert < experts; ++expert) summary->counts[expert] = counts[expert];
-    summary->entropySum = entropy;
     summary->dropped = droppedCount;
 }
 
@@ -279,6 +321,8 @@ Tensor MoELayer::forward(const Tensor& input, MoECache& cache, MoERoutingStats& 
     BLACKFORGE_CUDA_CHECK(cudaMemset(cache.assignmentsPerExpert.data(), 0, cache.assignmentsPerExpert.bytes()));
     Buffer summaryBuffer(sizeof(RoutingSummary), MemoryArena::Temporary);
     BLACKFORGE_CUDA_CHECK(cudaMemset(summaryBuffer.data(), 0, summaryBuffer.bytes()));
+    routingStatsKernel<<<gridFor(tokens), kBlockSize>>>(
+        cache.probabilities.data(), summaryBuffer.as<RoutingSummary>(), tokens, config_.numExperts);
     routeForwardKernel<<<1, 1>>>(
         cache.probabilities.data(), cache.expertOfSlot.data(), cache.weightOfSlot.data(),
         cache.tokensOfExpert.data(), cache.slotsOfExpert.data(), cache.assignmentsPerExpert.data(),
