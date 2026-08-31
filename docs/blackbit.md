@@ -834,6 +834,99 @@ di `nvcc` (funzioni host chiamate dal device, pressione sui registri,
 **Non sostituisce una build CUDA vera** — riduce il numero di giri
 necessari su una macchina con GPU, non li azzera.
 
+
+## 7.9 Portabilità Linux e ottimizzazione guidata dall'attribuzione per fase
+
+### Porting su Linux (MISURATO, NVIDIA L4 sm_89, Ubuntu 24.04, gcc 13.3, CUDA 13.0)
+
+Prima costruzione del motore fuori da Windows. Serve **una sola patch**:
+cinque file CUDA usano `std::uint64_t` e affini senza includere
+`<cstdint>`, che su MSVC arrivava per via transitiva e con libstdc++ no.
+Con l'include aggiunto: 87/87 target, **531/531 test sulla GPU**.
+
+Sulla L4, 9B-A3B, seq 512: 105,9 token/s a micro-batch 1 e 263,0 a
+micro-batch 16, con picco 8,38 GiB. Il micro-batch **satura**: da 8 a 16
+guadagna solo il 3,3 %, perché il costo fisso dell'ottimizzatore è ormai
+il 10 % del passo e non c'è quasi più nulla da ammortizzare.
+
+### Attribuzione per fase come strumento di lavoro
+
+Il profiler `--profile` introdotto in `6adcef0` ha guidato tutto il
+resto. Punto di partenza, RTX 5060, micro-batch 8, passo 15 372 ms:
+esperti 43,4 %, **attention 41,0 %**, router 6,3 %, ottimizzatore 8,6 %
+(sovrapposto), testa/loss 3,5 %.
+
+Attenzione a un confronto che non vale: i confini fra le fasi sono
+cambiati in `6adcef0`, quindi le voci "optimizer" e "forward+backward"
+**non sono confrontabili** prima e dopo quel commit. Solo il totale lo è.
+
+### Un'ipotesi sbagliata, misurata e scartata
+
+Il primo tentativo sull'attention raggruppava le query per ridurre le
+riletture di K e V. **Nessun guadagno**: 272,5 contro 270,9 token/s, cioè
+rumore. K e V di una coppia (batch, testa) sono 256 KiB e stavano già in
+L2: non c'era banda da recuperare. Il costo vero erano le **barriere**,
+non la memoria. L'esperimento è stato rimosso.
+
+### Le tre ottimizzazioni che hanno funzionato
+
+| intervento | fase | prima | dopo |
+|---|---|---:|---:|
+| attention forward per warp | attention | 6253,5 ms | 4104,2 ms |
+| attention backward per warp | attention | 4104,2 ms | 3389,6 ms |
+| `routingGradientKernel` a blocchi pieni | router | 942,7 ms | 442,3 ms |
+
+Il filo comune è **una riduzione di blocco dove bastava un warp**, o un
+lancio a thread singolo dove serviva un blocco:
+
+* L'attention dedicava un blocco di 128 thread a una riga di query e
+  chiudeva ogni prodotto scalare con due `__syncthreads`. Ora la riga è
+  posseduta da un warp, ogni lane tiene 4 delle 128 dimensioni e la somma
+  si chiude con una farfalla di `__shfl_xor_sync`: nessuna barriera,
+  nessuna memoria condivisa, 4 righe indipendenti per blocco.
+* `routingGradientKernel` era lanciato con `<<<tokens, 1>>>`: un thread
+  per blocco che percorreva in serie 3072 colonne in doppia precisione
+  per ciascuno dei 2 slot. Ora 128 thread si dividono le colonne, con
+  riduzione ad albero e accumulo ancora in double.
+
+Le due trasformazioni cambiano l'ordine di somma, quindi il risultato è
+equivalente entro la tolleranza e **non bit-identico**; la suite lo
+verifica contro il riferimento CPU. La conversione dei tre kernel
+`<<<tokens, 1>>>` residui è invece bit-identica e il suo guadagno
+(+0,5 %) è **dentro il rumore**: è stata tenuta per pulizia, non perché
+dimostri un miglioramento.
+
+### Risultato complessivo (MISURATO, RTX 5060, 9B-A3B, seq 512, mb 8)
+
+| | passo | throughput |
+|---|---:|---:|
+| partenza | 15 372,2 ms | 266,5 token/s |
+| arrivo | 11 502,2 ms | **356,1 token/s** |
+
+**+33,6 %.** Profilo finale: esperti 56,3 %, attention 27,9 %,
+ottimizzatore 10,8 %, testa/loss 4,3 %, router 4,0 %.
+
+Stabilità su 10 passi: loss monotona 10,900 → 10,245, picco stabile a
+6,883 GiB sotto il tetto di 7800 MiB, flip in calo da 65,2 M a 40,4 M,
+0 assegnazioni scartate, 0 NaN/Inf, entropia 2,077 nat, utilizzo massimo
+15,625 %, picco gradiente 12,00 MiB. Nessuna master copy, nessun buffer
+gradiente completo. Su 10 passi il throughput è 338,1 token/s, sotto i
+356,1 misurati su 3: la differenza è reale e va attribuita al
+comportamento su run lunghi, non ignorata.
+
+### Quello che resta, e il suo tetto
+
+Gli esperti sono ora il 56 % del passo e sono GEMM cuBLASLt. Le due leve
+rimaste sono l'accumulo FP16 (che **riduce la precisione numerica** e
+quindi va validato, non assunto) e il GEMM ternario nativo su tensor core
+INT8, che eliminerebbe il decode e raddoppierebbe il picco ma quantizza
+le attivazioni: è un cambio di semantica, non un'ottimizzazione.
+
+Nota su un numero non riprodotto: una sessione precedente riporta 95,222
+token/s a micro-batch 1 su `667e986`. Sulla stessa macchina, con lo
+stesso commit, qui se ne misurano 77,2. Il divario non è spiegato e i
+numeri di questa sezione usano soltanto misure riproducibili in loco.
+
 ## 8. Stato dei percorsi (aggiornato ad ogni fase)
 
 | Percorso | Stato | Verificato da |
