@@ -17,6 +17,8 @@ namespace blackforge::blackbit::cuda {
 namespace {
 
 constexpr int kBlockSize = 256;
+constexpr int kCudaWarpSizeMoE = 32;
+constexpr int kRoutingGradientThreads = 128;
 constexpr std::size_t kMaximumExperts = 32;
 
 struct RoutingSummary {
@@ -168,31 +170,75 @@ __global__ void combineRowsKernel(float* output, float* savedBySlot, const float
     output[token * hidden + column] += weights[slot] * value;
 }
 
-__global__ void routingGradientKernel(float* gradProbabilities, const float* probabilities,
-                                      const int* expertOfSlot, const float* weightOfSlot,
-                                      const float* expertOutputOfSlot, const float* gradOutput,
-                                      const int* counts, std::size_t tokens, std::size_t hidden,
-                                      std::size_t experts, std::size_t topK, std::size_t routed,
-                                      float auxiliaryWeight) {
+// Riduzione in doppia precisione su un blocco: il prodotto scalare del
+// gradiente di routing somma 'hidden' termini e va tenuto in double, quindi
+// anche la riduzione lo e'.
+template <int Threads>
+__device__ __forceinline__ double blockSumDouble(double value, double* shared) {
+    static_assert(Threads % kCudaWarpSizeMoE == 0);
+    constexpr int warps = Threads / kCudaWarpSizeMoE;
+    const int lane = static_cast<int>(threadIdx.x) & (kCudaWarpSizeMoE - 1);
+    const int warp = static_cast<int>(threadIdx.x) / kCudaWarpSizeMoE;
+    for (int offset = kCudaWarpSizeMoE / 2; offset > 0; offset >>= 1) {
+        value += __shfl_down_sync(0xffffffffU, value, offset);
+    }
+    if (lane == 0) shared[warp] = value;
+    __syncthreads();
+    if (warp == 0) {
+        value = lane < warps ? shared[lane] : 0.0;
+        for (int offset = kCudaWarpSizeMoE / 2; offset > 0; offset >>= 1) {
+            value += __shfl_down_sync(0xffffffffU, value, offset);
+        }
+        if (lane == 0) shared[0] = value;
+    }
+    __syncthreads();
+    return shared[0];
+}
+
+// Il kernel era lanciato con <<<tokens, 1>>>: un solo thread per blocco, che
+// sprecava 31 lane su 32 di ogni warp e percorreva in serie le 'hidden'
+// colonne per ciascuno dei topK slot. Ora il blocco ha kRoutingGradientThreads
+// thread che si dividono le colonne e chiudono con una riduzione ad albero.
+//
+// L'accumulo resta in doppia precisione; cambia l'ordine di somma, quindi il
+// risultato e' equivalente entro la tolleranza, non bit-identico. Su 3072
+// termini in double la differenza e' nell'ordine dell'epsilon.
+//
+// expertOfSlot non dipende da threadIdx, quindi i rami che lo consultano sono
+// uniformi nel blocco e i __syncthreads dentro la riduzione restano raggiunti
+// da tutti i thread.
+__global__ __launch_bounds__(kRoutingGradientThreads) void routingGradientKernel(
+    float* gradProbabilities, const float* probabilities, const int* expertOfSlot,
+    const float* weightOfSlot, const float* expertOutputOfSlot, const float* gradOutput,
+    const int* counts, std::size_t tokens, std::size_t hidden, std::size_t experts,
+    std::size_t topK, std::size_t routed, float auxiliaryWeight) {
     const std::size_t token = blockIdx.x;
-    if (token >= tokens || threadIdx.x != 0) return;
+    if (token >= tokens) return;
+    __shared__ double reduction[kRoutingGradientThreads / kCudaWarpSizeMoE];
+    __shared__ float slotGradient[8];
     float selectedMass = 0.0F;
     double correction = 0.0;
-    float slotGradient[8];
     for (std::size_t slot = 0; slot < topK; ++slot) {
         const std::size_t slotIndex = token * topK + slot;
         const int expert = expertOfSlot[slotIndex];
-        slotGradient[slot] = 0.0F;
-        if (expert < 0) continue;
-        double dot = 0.0;
-        for (std::size_t column = 0; column < hidden; ++column) {
-            dot += static_cast<double>(gradOutput[token * hidden + column]) *
-                   expertOutputOfSlot[slotIndex * hidden + column];
+        double partial = 0.0;
+        if (expert >= 0) {
+            for (std::size_t column = threadIdx.x; column < hidden;
+                 column += kRoutingGradientThreads) {
+                partial += static_cast<double>(gradOutput[token * hidden + column]) *
+                           static_cast<double>(expertOutputOfSlot[slotIndex * hidden + column]);
+            }
         }
-        slotGradient[slot] = static_cast<float>(dot);
-        selectedMass += probabilities[token * experts + static_cast<std::size_t>(expert)];
-        correction += dot * weightOfSlot[slotIndex];
+        const double dot = blockSumDouble<kRoutingGradientThreads>(partial, reduction);
+        if (threadIdx.x == 0) {
+            slotGradient[slot] = expert < 0 ? 0.0F : static_cast<float>(dot);
+            if (expert >= 0) {
+                selectedMass += probabilities[token * experts + static_cast<std::size_t>(expert)];
+                correction += dot * static_cast<double>(weightOfSlot[slotIndex]);
+            }
+        }
     }
+    if (threadIdx.x != 0) return;
     if (selectedMass > 0.0F) {
         for (std::size_t slot = 0; slot < topK; ++slot) {
             const std::size_t slotIndex = token * topK + slot;
@@ -386,7 +432,7 @@ Tensor MoELayer::backward(const Tensor& input, const Tensor& gradOutput, const M
     const std::size_t routed = stats.assignments - stats.droppedAssignments;
     Tensor gradProbabilities = Tensor::zeros({cache.tokens, config_.numExperts}, MemoryArena::MoeDispatch);
     GpuProfiler::instance().begin(GpuPhase::Router);
-    routingGradientKernel<<<static_cast<unsigned int>(cache.tokens), 1>>>(
+    routingGradientKernel<<<static_cast<unsigned int>(cache.tokens), kRoutingGradientThreads>>>(
         gradProbabilities.data(), cache.probabilities.data(), cache.expertOfSlot.data(),
         cache.weightOfSlot.data(), cache.expertOutputOfSlot.data(), gradOutput.data(),
         cache.assignmentsPerExpert.data(), cache.tokens, config_.hiddenSize, config_.numExperts,
