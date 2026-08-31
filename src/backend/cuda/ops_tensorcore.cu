@@ -1,6 +1,7 @@
 #include <cuda_bf16.h>
 #include <cublasLt.h>
 
+#include <cstdint>
 #include <map>
 #include <stdexcept>
 #include <tuple>
