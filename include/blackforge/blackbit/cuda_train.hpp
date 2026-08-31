@@ -21,6 +21,18 @@ struct TrainingOptions {
     std::size_t microBatch = 1;
     std::size_t maxVramMb = 7800;
     unsigned int seed = 42;
+    // Scheduler del learning rate. warmupSteps a 0 disattiva il warmup;
+    // scheduleSteps a 0 significa "usa steps". Su un run ripreso da
+    // checkpoint scheduleSteps deve valere il totale pianificato dell'INTERO
+    // addestramento, non i passi di questa invocazione, altrimenti il coseno
+    // riparte da capo a ogni ripresa.
+    // Salvataggio periodico: 0 = solo alla fine del run. Il file viene scritto
+    // su un temporaneo e poi rinominato sopra la destinazione, cosi' una
+    // interruzione durante la scrittura non distrugge il checkpoint buono.
+    std::size_t checkpointEvery = 0;
+    std::size_t warmupSteps = 0;
+    std::size_t scheduleSteps = 0;
+    float minLearningRateRatio = 0.1F;
     LowRankOptimizerOptions optimizer;
     BlackBitRuntimeOptions runtime;
 };

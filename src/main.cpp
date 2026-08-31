@@ -113,6 +113,14 @@ void printUsage() {
               << "  --max-vram-mb N    Budget di memoria: superarlo e' un errore diagnosticato prima di allocare "
                  "(solo 'benchmark blackbit', default 7800, 0 = nessun limite)\n"
               << "  --optimizer-rank N Rango del sottospazio dell'ottimizzatore (solo 'benchmark blackbit')\n"
+              << "  --checkpoint-every N  Salva un checkpoint ogni N passi, non solo alla fine. Scrittura su\n"
+              << "                     temporaneo e rinomina: un'interruzione non corrompe il file buono\n"
+              << "                     (solo 'train blackbit', default 0 = solo alla fine)\n"
+              << "  --learning-rate F  Learning rate di picco (solo 'train blackbit')\n"
+              << "  --warmup-steps N   Passi di warmup lineare prima del coseno (solo 'train blackbit')\n"
+              << "  --schedule-steps N Passi totali PIANIFICATI su cui stendere il coseno; riprendendo da un\n"
+              << "                     checkpoint va indicato il totale dell'intero addestramento, non i passi\n"
+              << "                     di questa invocazione (solo 'train blackbit', default --steps)\n"
               << "  --recompute MODO   none | per-layer | every-N | full: quante attivazioni conservare invece "
                  "di ricalcolarle (solo 'benchmark blackbit', default per-layer)\n"
               << "  --dry-run          Riporta solo la contabilita' prevista, senza allocare nulla (solo "
@@ -877,7 +885,10 @@ int runBlackBitTraining(const std::string& configPath, const std::string& preset
                         std::size_t microBatch, std::size_t steps,
                         std::size_t maxVramMb, std::size_t optimizerRank,
                         const std::string& recomputeMode, const std::string& fromCheckpoint,
-                        const std::string& saveCheckpoint, const std::string& device) {
+                        const std::string& saveCheckpoint, float learningRate,
+                        std::size_t warmupSteps, std::size_t scheduleSteps,
+                        std::size_t checkpointEvery,
+                        const std::string& device) {
 #if BLACKFORGE_HAS_CUDA
     try {
         DeviceSpec spec;
@@ -898,6 +909,10 @@ int runBlackBitTraining(const std::string& configPath, const std::string& preset
         options.steps = steps == 0 ? 100 : steps;
         options.maxVramMb = maxVramMb;
         if (optimizerRank != 0) options.optimizer.rank = optimizerRank;
+        if (learningRate > 0.0F) options.optimizer.learningRate = learningRate;
+        options.warmupSteps = warmupSteps;
+        options.scheduleSteps = scheduleSteps;
+        options.checkpointEvery = checkpointEvery;
         if (recomputeMode == "none") {
             options.runtime.recompute = blackforge::blackbit::ActivationRecompute::None;
         } else if (recomputeMode.empty() || recomputeMode == "per-layer") {
@@ -1169,6 +1184,10 @@ int main(int argc, char** argv) {
     std::size_t steps = 0;
     std::size_t maxVramMb = 7800;
     std::size_t optimizerRank = 0;
+    float learningRate = 0.0F;
+    std::size_t warmupSteps = 0;
+    std::size_t scheduleSteps = 0;
+    std::size_t checkpointEvery = 0;
     std::string recomputeMode;
     bool dryRun = false;
     bool instantiateOnly = false;
@@ -1302,6 +1321,30 @@ int main(int argc, char** argv) {
                 return 2;
             }
             maxVramMb = static_cast<std::size_t>(std::strtoull(args[++i].c_str(), nullptr, 10));
+        } else if (args[i] == "--checkpoint-every") {
+            if (i + 1 >= args.size()) {
+                std::cerr << "errore: '--checkpoint-every' richiede un valore\n";
+                return 2;
+            }
+            checkpointEvery = static_cast<std::size_t>(std::strtoull(args[++i].c_str(), nullptr, 10));
+        } else if (args[i] == "--learning-rate") {
+            if (i + 1 >= args.size()) {
+                std::cerr << "errore: '--learning-rate' richiede un valore\n";
+                return 2;
+            }
+            learningRate = std::strtof(args[++i].c_str(), nullptr);
+        } else if (args[i] == "--warmup-steps") {
+            if (i + 1 >= args.size()) {
+                std::cerr << "errore: '--warmup-steps' richiede un valore\n";
+                return 2;
+            }
+            warmupSteps = static_cast<std::size_t>(std::strtoull(args[++i].c_str(), nullptr, 10));
+        } else if (args[i] == "--schedule-steps") {
+            if (i + 1 >= args.size()) {
+                std::cerr << "errore: '--schedule-steps' richiede un valore\n";
+                return 2;
+            }
+            scheduleSteps = static_cast<std::size_t>(std::strtoull(args[++i].c_str(), nullptr, 10));
         } else if (args[i] == "--optimizer-rank") {
             if (i + 1 >= args.size()) {
                 std::cerr << "errore: '--optimizer-rank' richiede un valore\n";
@@ -1372,7 +1415,8 @@ int main(int argc, char** argv) {
         if (positional.front() == "blackbit") {
             const std::string preset = positional.size() > 1 ? positional[1] : std::string();
             return runBlackBitTraining(configPath, preset, datasetPath, tokenizerPath, microBatch, steps, maxVramMb,
-                                       optimizerRank, recomputeMode, fromCheckpoint, saveCheckpointPath, device);
+                                       optimizerRank, recomputeMode, fromCheckpoint, saveCheckpointPath, learningRate, warmupSteps,
+                                       scheduleSteps, checkpointEvery, device);
         }
         return runTrain(positional.front(), fromCheckpoint, saveCheckpointPath, device, devicesList);
     }

@@ -140,6 +140,22 @@ std::string TrainingResult::report() const {
     return out.str();
 }
 
+// Warmup lineare seguito da decadimento a coseno fino a minRatio del picco.
+// Dipende dal passo GLOBALE, non da quello locale: cosi' una ripresa da
+// checkpoint prosegue la stessa curva invece di ricominciarla.
+float scheduledLearningRate(float peak, std::uint64_t globalStep, std::size_t warmupSteps,
+                            std::size_t totalSteps, float minRatio) {
+    if (warmupSteps > 0 && globalStep < warmupSteps) {
+        return peak * static_cast<float>(globalStep + 1) / static_cast<float>(warmupSteps);
+    }
+    if (totalSteps <= warmupSteps) return peak;
+    const double span = static_cast<double>(totalSteps - warmupSteps);
+    const double done = static_cast<double>(globalStep - warmupSteps);
+    const double progress = done >= span ? 1.0 : done / span;
+    const double factor = 0.5 * (1.0 + std::cos(3.14159265358979323846 * progress));
+    return peak * static_cast<float>(minRatio + (1.0 - minRatio) * factor);
+}
+
 TrainingResult train(const BlackBitConfig& config, const TrainingOptions& options, int device,
                      std::ostream* progress) {
     config.validate();
@@ -184,7 +200,13 @@ TrainingResult train(const BlackBitConfig& config, const TrainingOptions& option
     telemetry.resetPeaks();
     double totalMilliseconds = 0.0;
     std::size_t memorySum = 0;
+    const std::size_t scheduleSteps =
+        options.scheduleSteps == 0 ? options.steps : options.scheduleSteps;
     for (std::size_t localStep = 0; localStep < options.steps; ++localStep) {
+        state.learningRate =
+            scheduledLearningRate(options.optimizer.learningRate, state.step, options.warmupSteps,
+                                  scheduleSteps, options.minLearningRateRatio);
+        optimizer.setLearningRate(state.learningRate);
         const std::uint64_t globalExample = state.step * options.microBatch;
         const std::size_t exampleIndex = static_cast<std::size_t>(globalExample % examples);
         const std::uint64_t epoch = globalExample / examples;
@@ -224,6 +246,22 @@ TrainingResult train(const BlackBitConfig& config, const TrainingOptions& option
                       << gib(memory.devicePeakUsedBytes) << "\n";
         }
         if (result.nanInfCount != 0) throw std::runtime_error("CUDA BlackBit trainer: numerical instability");
+        if (options.checkpointEvery != 0 && !options.saveCheckpoint.empty() &&
+            (localStep + 1) % options.checkpointEvery == 0 && localStep + 1 != options.steps) {
+            // Scrittura su temporaneo e rinomina: se il processo muore a meta'
+            // della scrittura, il checkpoint precedente resta intatto e la
+            // rinomina non e' mai osservata a meta'.
+            const std::filesystem::path target(options.saveCheckpoint);
+            std::filesystem::path temporary = target;
+            temporary += ".tmp";
+            cuda::saveCheckpoint(temporary.string(), model, state, &optimizer);
+            std::filesystem::rename(temporary, target);
+            saveTrainingManifest(options.saveCheckpoint, options, config, seq, state);
+            if (progress != nullptr) {
+                *progress << "  checkpoint al passo " << state.step << ": " << options.saveCheckpoint
+                          << "\n";
+            }
+        }
     }
     result.finalStep = state.step;
     result.finalTokens = state.tokensSeen;
