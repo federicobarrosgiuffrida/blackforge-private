@@ -84,6 +84,9 @@ private:
         Buffer scaleFirstMoment;
         Buffer scaleSecondMoment;
         Buffer scaleAccumulator;
+        // Residuo di arrotondamento, un float per peso. Allocato solo se
+        // options_.errorFeedback e' attivo.
+        Buffer tritResidual;
         std::size_t scaleCount = 0;
         // Magnitudine tipica delle scale, misurata all'inizializzazione:
         // rende l'aggiornamento relativo invece che assoluto.

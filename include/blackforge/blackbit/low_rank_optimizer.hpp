@@ -76,6 +76,25 @@ struct LowRankOptimizerOptions {
     // ulteriormente non ha significato.
     float weightDecay = 0.0F;
 
+    // Accumulo del residuo di arrotondamento ("error feedback").
+    //
+    // Senza, un aggiornamento piu' piccolo del passo della griglia ternaria
+    // viene giocato a dadi e quasi sempre perso: il segnale non arriva mai
+    // nei pesi. Con l'accumulo il peso latente e' L = trit + residuo, si
+    // aggiorna L, si arrotonda al trit piu' vicino e cio' che avanza resta
+    // per il passo successivo, finche' non basta a far scattare un trit.
+    //
+    // Quando e' attivo l'arrotondamento diventa deterministico: quello
+    // stocastico esiste per essere non distorto SENZA memoria, e sommato a
+    // una memoria aggiungerebbe rumore che la memoria stessa deve poi
+    // correggere.
+    //
+    // Costa un float per peso. Sul modello 60 M sono 240 MB; su un 9B
+    // sarebbero 36 GB, cioe' la copia master che BlackBit esiste per non
+    // avere: a quella scala il residuo va compresso a 4 o 8 bit. Qui serve
+    // a verificare l'ipotesi dove la memoria non e' un problema.
+    bool errorFeedback = false;
+
     // Rango di default del sottospazio. Configurabile per parametro con
     // setRankFor().
     std::size_t rank = 32;

@@ -319,7 +319,7 @@ constexpr std::size_t kComponentTile = 32;
 // dipendono da (riga, colonna) e non dalla forma della griglia. Cambia
 // solo il raggruppamento di updateSquared, che alimenta il solo
 // updateRms diagnostico.
-__global__ void updatePackedKernel(std::uint32_t* packed, std::size_t rows, std::size_t cols,
+__global__ void updatePackedKernel(std::uint32_t* packed, float* residual, std::size_t rows, std::size_t cols,
                                    std::size_t wordsPerRow, const float* direction, std::size_t rank,
                                    float learningRate, std::uint64_t seed, std::uint64_t epoch,
                                    std::uint64_t step, DeviceStepStats* stats) {
@@ -400,8 +400,23 @@ __global__ void updatePackedKernel(std::uint32_t* packed, std::size_t rows, std:
             continue;
         }
         const int oldTrit = trits[slot];
-        const float target = static_cast<float>(oldTrit) + update;
-        const int newTrit = stochasticRoundToTrit(target, stepSeed, row * cols + col);
+        const std::size_t flat = row * cols + col;
+        // Con il residuo il peso latente e' L = trit + residuo: si somma
+        // l'aggiornamento a L, si arrotonda al trit piu' vicino, e cio' che
+        // avanza resta per il passo dopo. Senza residuo resta il
+        // comportamento originale, arrotondamento stocastico e resto
+        // scartato.
+        int newTrit;
+        float target;
+        if (residual == nullptr) {
+            target = static_cast<float>(oldTrit) + update;
+            newTrit = stochasticRoundToTrit(target, stepSeed, flat);
+        } else {
+            target = static_cast<float>(oldTrit) + residual[flat] + update;
+            const float rounded = rintf(target);
+            newTrit = rounded < -1.0F ? -1 : (rounded > 1.0F ? 1 : static_cast<int>(rounded));
+            residual[flat] = target - static_cast<float>(newTrit);
+        }
         trits[slot] = newTrit;
         ++elements;
         updateSquared += static_cast<double>(update) * static_cast<double>(update);
@@ -505,6 +520,12 @@ void LowRankProjectedOptimizer::allocateState(const std::string& name, State& st
     BLACKFORGE_CUDA_CHECK(cudaMemset(state.firstMoment.data(), 0, bytes));
     BLACKFORGE_CUDA_CHECK(cudaMemset(state.secondMoment.data(), 0, bytes));
     BLACKFORGE_CUDA_CHECK(cudaMemset(state.accumulator.data(), 0, bytes));
+    if (options_.errorFeedback) {
+        const std::size_t residualBytes = state.rows * state.cols * sizeof(float);
+        state.tritResidual = Buffer(residualBytes, MemoryArena::Optimizer);
+        BLACKFORGE_CUDA_CHECK(cudaMemset(state.tritResidual.data(), 0, residualBytes));
+    }
+
     state.scaleCount = state.rows * weight.groupsPerRow();
     const std::size_t scaleBytes = state.scaleCount * sizeof(float);
     state.scaleFirstMoment = Buffer(scaleBytes, MemoryArena::Optimizer);
@@ -643,7 +664,9 @@ void LowRankProjectedOptimizer::endStep() {
         const dim3 updateGrid(static_cast<unsigned int>(state.weight->wordsPerRow()),
                               gridFor(state.rows));
         updatePackedKernel<<<updateGrid, kBlockSize>>>(
-            state.weight->packedWords(), state.rows, state.cols, state.weight->wordsPerRow(),
+            state.weight->packedWords(),
+            state.tritResidual.bytes() == 0 ? nullptr : state.tritResidual.as<float>(), state.rows,
+            state.cols, state.weight->wordsPerRow(),
             state.accumulator.as<float>(), state.rank, options_.learningRate, state.seed, state.projectionEpoch,
             step_, deviceStats_.as<DeviceStepStats>());
         BLACKFORGE_CUDA_CHECK(cudaMemset(state.accumulator.data(), 0, state.accumulator.bytes()));
