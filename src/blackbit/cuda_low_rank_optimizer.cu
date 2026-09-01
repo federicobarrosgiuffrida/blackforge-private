@@ -319,7 +319,7 @@ constexpr std::size_t kComponentTile = 32;
 // dipendono da (riga, colonna) e non dalla forma della griglia. Cambia
 // solo il raggruppamento di updateSquared, che alimenta il solo
 // updateRms diagnostico.
-__global__ void updatePackedKernel(std::uint32_t* packed, float* residual, std::size_t rows, std::size_t cols,
+__global__ void updatePackedKernel(std::uint32_t* packed, float* residual, float latentClamp, std::size_t rows, std::size_t cols,
                                    std::size_t wordsPerRow, const float* direction, std::size_t rank,
                                    float learningRate, std::uint64_t seed, std::uint64_t epoch,
                                    std::uint64_t step, DeviceStepStats* stats) {
@@ -421,7 +421,7 @@ __global__ void updatePackedKernel(std::uint32_t* packed, float* residual, std::
             // Col limite il residuo resta per costruzione in [-0,5, +0,5],
             // che e' anche cio' che ne rende possibile la memorizzazione a
             // pochi bit.
-            const float latent = fminf(fmaxf(static_cast<float>(oldTrit) + residual[flat] + update, -1.0F), 1.0F);
+            const float latent = fminf(fmaxf(static_cast<float>(oldTrit) + residual[flat] + update, -latentClamp), latentClamp);
             target = latent;
             const float rounded = rintf(latent);
             newTrit = rounded < -1.0F ? -1 : (rounded > 1.0F ? 1 : static_cast<int>(rounded));
@@ -675,7 +675,8 @@ void LowRankProjectedOptimizer::endStep() {
                               gridFor(state.rows));
         updatePackedKernel<<<updateGrid, kBlockSize>>>(
             state.weight->packedWords(),
-            state.tritResidual.bytes() == 0 ? nullptr : state.tritResidual.as<float>(), state.rows,
+            state.tritResidual.bytes() == 0 ? nullptr : state.tritResidual.as<float>(), options_.latentClamp,
+            state.rows,
             state.cols, state.weight->wordsPerRow(),
             state.accumulator.as<float>(), state.rank, options_.learningRate, state.seed, state.projectionEpoch,
             step_, deviceStats_.as<DeviceStepStats>());

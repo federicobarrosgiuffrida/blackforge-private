@@ -113,6 +113,9 @@ void printUsage() {
               << "  --max-vram-mb N    Budget di memoria: superarlo e' un errore diagnosticato prima di allocare "
                  "(solo 'benchmark blackbit', default 7800, 0 = nessun limite)\n"
               << "  --optimizer-rank N Rango del sottospazio dell'ottimizzatore (solo 'benchmark blackbit')\n"
+              << "  --latent-clamp F   Ampiezza del limite sul peso latente con --error-feedback (default 1).\n"
+              << "                     Valori maggiori restituiscono inerzia contro il rumore del gradiente,\n"
+              << "                     tenendo comunque il residuo limitato\n"
               << "  --error-feedback   Accumula il residuo di arrotondamento invece di scartarlo: il peso\n"
               << "                     latente diventa trit + residuo e l'arrotondamento passa da stocastico\n"
               << "                     a deterministico. Costa un float per peso (solo 'train blackbit')\n"
@@ -941,7 +944,7 @@ int runBlackBitTraining(const std::string& configPath, const std::string& preset
                         const std::string& recomputeMode, const std::string& fromCheckpoint,
                         const std::string& saveCheckpoint, float learningRate,
                         std::size_t warmupSteps, std::size_t scheduleSteps,
-                        std::size_t checkpointEvery, bool errorFeedback,
+                        std::size_t checkpointEvery, bool errorFeedback, float latentClamp,
                         const std::string& device) {
 #if BLACKFORGE_HAS_CUDA
     try {
@@ -968,6 +971,7 @@ int runBlackBitTraining(const std::string& configPath, const std::string& preset
         options.scheduleSteps = scheduleSteps;
         options.checkpointEvery = checkpointEvery;
         options.optimizer.errorFeedback = errorFeedback;
+        if (latentClamp > 0.0F) options.optimizer.latentClamp = latentClamp;
         if (recomputeMode == "none") {
             options.runtime.recompute = blackforge::blackbit::ActivationRecompute::None;
         } else if (recomputeMode.empty() || recomputeMode == "per-layer") {
@@ -1244,6 +1248,7 @@ int main(int argc, char** argv) {
     std::size_t scheduleSteps = 0;
     std::size_t checkpointEvery = 0;
     bool errorFeedback = false;
+    float latentClamp = 0.0F;
     std::string recomputeMode;
     bool dryRun = false;
     bool instantiateOnly = false;
@@ -1377,6 +1382,12 @@ int main(int argc, char** argv) {
                 return 2;
             }
             maxVramMb = static_cast<std::size_t>(std::strtoull(args[++i].c_str(), nullptr, 10));
+        } else if (args[i] == "--latent-clamp") {
+            if (i + 1 >= args.size()) {
+                std::cerr << "errore: '--latent-clamp' richiede un valore\n";
+                return 2;
+            }
+            latentClamp = std::strtof(args[++i].c_str(), nullptr);
         } else if (args[i] == "--error-feedback") {
             errorFeedback = true;
         } else if (args[i] == "--checkpoint-every") {
@@ -1474,7 +1485,7 @@ int main(int argc, char** argv) {
             const std::string preset = positional.size() > 1 ? positional[1] : std::string();
             return runBlackBitTraining(configPath, preset, datasetPath, tokenizerPath, microBatch, steps, maxVramMb,
                                        optimizerRank, recomputeMode, fromCheckpoint, saveCheckpointPath, learningRate, warmupSteps,
-                                       scheduleSteps, checkpointEvery, errorFeedback, device);
+                                       scheduleSteps, checkpointEvery, errorFeedback, latentClamp, device);
         }
         return runTrain(positional.front(), fromCheckpoint, saveCheckpointPath, device, devicesList);
     }

@@ -95,6 +95,13 @@ struct LowRankOptimizerOptions {
     // a verificare l'ipotesi dove la memoria non e' un problema.
     bool errorFeedback = false;
 
+    // Ampiezza del limite sul peso latente quando errorFeedback e' attivo.
+    // A 1 il peso resta sempre a mezzo passo dal ribaltarsi e assorbe poco
+    // rumore; valori maggiori restituiscono inerzia contro le oscillazioni
+    // del gradiente, mantenendo comunque il residuo limitato e quindi
+    // memorizzabile a pochi bit.
+    float latentClamp = 1.0F;
+
     // Rango di default del sottospazio. Configurabile per parametro con
     // setRankFor().
     std::size_t rank = 32;
