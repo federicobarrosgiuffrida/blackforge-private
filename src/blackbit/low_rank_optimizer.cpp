@@ -64,6 +64,19 @@ void LowRankProjectedOptimizer::registerTernary(const std::string& name, Ternary
     // comprime.
     state.rank = std::min(requested, state.rows);
 
+    const std::size_t scaleCount = state.rows * weight.groupsPerRow();
+    state.scaleFirstMoment.assign(scaleCount, 0.0F);
+    state.scaleSecondMoment.assign(scaleCount, 0.0F);
+    state.scaleAccumulator.assign(scaleCount, 0.0F);
+    // Magnitudine tipica delle scale: rende l'aggiornamento relativo invece
+    // che assoluto. learningRate e' calibrato sulla griglia ternaria, e
+    // applicarlo tale e quale a un parametro continuo lo muoverebbe di un
+    // ordine di grandezza per passo.
+    double squared = 0.0;
+    for (float value : weight.scales()) squared += static_cast<double>(value) * value;
+    const double rms = scaleCount == 0 ? 0.0 : std::sqrt(squared / static_cast<double>(scaleCount));
+    state.scaleRms = rms > 0.0 ? static_cast<float>(rms) : 1.0F;
+
     const std::size_t values = state.rank * state.cols;
     state.firstMoment.assign(values, 0.0F);
     state.secondMoment.assign(values, 0.0F);
@@ -132,6 +145,26 @@ void LowRankProjectedOptimizer::consumeWeightGradientBlock(const ParameterId& id
             for (std::size_t c = 0; c < state.cols; ++c) {
                 target[c] += p * gradientRow[c];
             }
+        }
+    }
+
+    // dL/ds_g = somma sui pesi del gruppo di dL/dW_ij * trit_ij, perche'
+    // W_ij = trit_ij * s_g. Somma in ordine di colonna crescente, lo stesso
+    // ordine del kernel CUDA, cosi' i due percorsi restano confrontabili.
+    const std::size_t groupsPerRow = state.weight->groupsPerRow();
+    const std::size_t groupSize = state.weight->groupSize();
+    for (std::size_t r = 0; r < rowCount; ++r) {
+        const std::size_t row = firstRow + r;
+        const float* gradientRow = block + r * state.cols;
+        for (std::size_t g = 0; g < groupsPerRow; ++g) {
+            const std::size_t firstColumn = g * groupSize;
+            if (firstColumn >= state.cols) break;
+            const std::size_t lastColumn = std::min(firstColumn + groupSize, state.cols);
+            float partial = 0.0F;
+            for (std::size_t c = firstColumn; c < lastColumn; ++c) {
+                partial += gradientRow[c] * static_cast<float>(state.weight->tritAt(row * state.cols + c));
+            }
+            state.scaleAccumulator[row * groupsPerRow + g] += partial;
         }
     }
 }
@@ -310,6 +343,29 @@ void LowRankProjectedOptimizer::applyDenseUpdate(DenseState& state) {
     }
 }
 
+// Adam ordinario sulle scale: sono parametri continui, senza proiezione e
+// senza quantizzazione. Nessun weight decay, perche' far decadere una scala
+// verso zero spegnerebbe l'intero gruppo di pesi che governa.
+void LowRankProjectedOptimizer::applyScaleUpdate(TernaryState& state) {
+    if (state.scaleAccumulator.empty()) {
+        return;
+    }
+    const float bias1 = 1.0F - std::pow(options_.beta1, static_cast<float>(step_ + 1));
+    const float bias2 = 1.0F - std::pow(options_.beta2, static_cast<float>(step_ + 1));
+    std::vector<float>& scales = state.weight->scales();
+    for (std::size_t i = 0; i < state.scaleAccumulator.size(); ++i) {
+        const float gradient = state.scaleAccumulator[i];
+        state.scaleFirstMoment[i] =
+            options_.beta1 * state.scaleFirstMoment[i] + (1.0F - options_.beta1) * gradient;
+        state.scaleSecondMoment[i] =
+            options_.beta2 * state.scaleSecondMoment[i] + (1.0F - options_.beta2) * gradient * gradient;
+        const float m = state.scaleFirstMoment[i] / bias1;
+        const float v = state.scaleSecondMoment[i] / bias2;
+        scales[i] -= options_.learningRate * state.scaleRms * (m / (std::sqrt(v) + options_.eps));
+        state.scaleAccumulator[i] = 0.0F;
+    }
+}
+
 void LowRankProjectedOptimizer::endStep() {
     for (auto& entry : ternary_) {
         TernaryState& state = entry.second;
@@ -317,6 +373,7 @@ void LowRankProjectedOptimizer::endStep() {
             continue;
         }
         applyTernaryUpdate(state);
+        applyScaleUpdate(state);
         std::fill(state.accumulator.begin(), state.accumulator.end(), 0.0F);
         state.touched = false;
     }
@@ -439,6 +496,16 @@ void LowRankProjectedOptimizer::serializeState(std::ostream& out) const {
         writeVector(out, entry.second.firstMoment);
         writeVector(out, entry.second.secondMoment);
         writeVector(out, entry.second.residual);
+        // Momenti Adam delle scale: senza, una ripresa da checkpoint
+        // ripartirebbe con lo slancio azzerato e non riprodurrebbe il run
+        // ininterrotto.
+        writeVector(out, entry.second.scaleFirstMoment);
+        writeVector(out, entry.second.scaleSecondMoment);
+        // scaleRms e' misurato alla registrazione sulle scale di allora.
+        // Ricalcolarlo dopo una ripresa lo misurerebbe su scale gia'
+        // addestrate, dando un fattore diverso da quello del run
+        // ininterrotto: va salvato, non ricostruito.
+        writeScalar<float>(out, entry.second.scaleRms);
     }
     writeScalar<std::uint32_t>(out, static_cast<std::uint32_t>(dense_.size()));
     for (const auto& entry : dense_) {
@@ -472,6 +539,9 @@ void LowRankProjectedOptimizer::deserializeState(std::istream& in) {
         readVector(in, it->second.firstMoment);
         readVector(in, it->second.secondMoment);
         readVector(in, it->second.residual);
+        readVector(in, it->second.scaleFirstMoment);
+        readVector(in, it->second.scaleSecondMoment);
+        it->second.scaleRms = readScalar<float>(in);
     }
 
     const auto denseCount = readScalar<std::uint32_t>(in);

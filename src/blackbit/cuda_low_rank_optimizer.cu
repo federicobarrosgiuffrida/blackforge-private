@@ -21,6 +21,7 @@ namespace blackforge::blackbit::cuda {
 namespace {
 
 constexpr int kBlockSize = 256;
+constexpr int kCudaWarpSizeOptimizer = 32;
 
 struct DeviceStepStats {
     unsigned long long elements;
@@ -187,6 +188,47 @@ __global__ void squaredNormKernel(const float* values, std::size_t count, double
     if (index < count) {
         const double value = values[index];
         atomicAdd(squared, value * value);
+    }
+}
+
+// Gradiente rispetto alla scala di un gruppo.
+//
+// Un peso ternario vale W_ij = trit_ij * s_g, quindi dW_ij/ds_g = trit_ij e
+// dL/ds_g = somma sui pesi del gruppo di dL/dW_ij * trit_ij. Il blocco di
+// gradiente arriva a pezzi di righe, percio' ogni lancio accumula solo il
+// contributo delle righe che ha in mano; l'accumulatore viene azzerato in
+// endStep dopo l'aggiornamento, come per la proiezione.
+//
+// Un blocco = un warp = una coppia (riga, gruppo). Il gruppo copre groupSize
+// colonne consecutive e l'ultimo gruppo di una riga puo' essere parziale
+// quando cols non e' multiplo di groupSize.
+__global__ void scaleGradientKernel(float* scaleAccumulator, const float* block,
+                                    const std::uint32_t* packed, std::size_t firstRow,
+                                    std::size_t rowCount, std::size_t cols, std::size_t wordsPerRow,
+                                    std::size_t groupsPerRow, std::size_t groupSize) {
+    const std::size_t localRow = blockIdx.y;
+    const std::size_t group = blockIdx.x;
+    if (localRow >= rowCount || group >= groupsPerRow) return;
+    const std::size_t row = firstRow + localRow;
+    const std::size_t firstCol = group * groupSize;
+    if (firstCol >= cols) return;
+    const std::size_t lastCol = min(firstCol + groupSize, cols);
+
+    float partial = 0.0F;
+    for (std::size_t col = firstCol + threadIdx.x; col < lastCol; col += blockDim.x) {
+        const std::size_t wordInRow = col / kTritsPerWord;
+        const std::size_t inWord = col - wordInRow * kTritsPerWord;
+        const std::uint32_t word = packed[row * wordsPerRow + wordInRow];
+        const std::size_t byteIndex = inWord / kTritsPerByte;
+        const std::size_t slot = inWord - byteIndex * kTritsPerByte;
+        const int trit = decodeTritAt(wordByte(word, static_cast<int>(byteIndex)), static_cast<int>(slot));
+        partial += block[localRow * cols + col] * static_cast<float>(trit);
+    }
+    for (int offset = warpSize / 2; offset > 0; offset >>= 1) {
+        partial += __shfl_down_sync(0xffffffffU, partial, offset);
+    }
+    if (threadIdx.x == 0) {
+        atomicAdd(&scaleAccumulator[row * groupsPerRow + group], partial);
     }
 }
 
@@ -463,6 +505,25 @@ void LowRankProjectedOptimizer::allocateState(const std::string& name, State& st
     BLACKFORGE_CUDA_CHECK(cudaMemset(state.firstMoment.data(), 0, bytes));
     BLACKFORGE_CUDA_CHECK(cudaMemset(state.secondMoment.data(), 0, bytes));
     BLACKFORGE_CUDA_CHECK(cudaMemset(state.accumulator.data(), 0, bytes));
+    state.scaleCount = state.rows * weight.groupsPerRow();
+    const std::size_t scaleBytes = state.scaleCount * sizeof(float);
+    state.scaleFirstMoment = Buffer(scaleBytes, MemoryArena::Optimizer);
+    state.scaleSecondMoment = Buffer(scaleBytes, MemoryArena::Optimizer);
+    state.scaleAccumulator = Buffer(scaleBytes, MemoryArena::Optimizer);
+    BLACKFORGE_CUDA_CHECK(cudaMemset(state.scaleFirstMoment.data(), 0, scaleBytes));
+    BLACKFORGE_CUDA_CHECK(cudaMemset(state.scaleSecondMoment.data(), 0, scaleBytes));
+    BLACKFORGE_CUDA_CHECK(cudaMemset(state.scaleAccumulator.data(), 0, scaleBytes));
+    if (state.scaleCount != 0) {
+        Buffer squared(sizeof(double), MemoryArena::Temporary);
+        BLACKFORGE_CUDA_CHECK(cudaMemset(squared.data(), 0, squared.bytes()));
+        squaredNormKernel<<<gridFor(state.scaleCount), kBlockSize>>>(weight.scales(), state.scaleCount,
+                                                                     squared.as<double>());
+        double hostSquared = 0.0;
+        BLACKFORGE_CUDA_CHECK(
+            cudaMemcpy(&hostSquared, squared.data(), sizeof(hostSquared), cudaMemcpyDeviceToHost));
+        const double rms = std::sqrt(hostSquared / static_cast<double>(state.scaleCount));
+        state.scaleRms = rms > 0.0 ? static_cast<float>(rms) : 1.0F;
+    }
 }
 
 void LowRankProjectedOptimizer::registerTernary(const std::string& name, cuda::TernaryTensor& weight) {
@@ -538,6 +599,11 @@ void LowRankProjectedOptimizer::consumeWeightGradientBlock(const ParameterId& id
     projectGradientKernel<<<projectionGrid, kBlockSize>>>(
         state.accumulator.as<float>(), deviceBlock, firstRow, rowCount, state.cols, state.rank, state.seed,
         state.projectionEpoch, deviceStats_.as<DeviceStepStats>());
+    const dim3 scaleGrid(static_cast<unsigned int>(state.weight->groupsPerRow()),
+                         static_cast<unsigned int>(rowCount));
+    scaleGradientKernel<<<scaleGrid, kCudaWarpSizeOptimizer>>>(
+        state.scaleAccumulator.as<float>(), deviceBlock, state.weight->packedWords(), firstRow, rowCount,
+        state.cols, state.weight->wordsPerRow(), state.weight->groupsPerRow(), state.weight->groupSize());
     BLACKFORGE_CUDA_CHECK(cudaGetLastError());
 }
 
@@ -581,6 +647,19 @@ void LowRankProjectedOptimizer::endStep() {
             state.accumulator.as<float>(), state.rank, options_.learningRate, state.seed, state.projectionEpoch,
             step_, deviceStats_.as<DeviceStepStats>());
         BLACKFORGE_CUDA_CHECK(cudaMemset(state.accumulator.data(), 0, state.accumulator.bytes()));
+        // Le scale sono parametri continui ordinari: stesso Adam dei tensori
+        // densi, senza proiezione e senza quantizzazione. parameterScale a 1
+        // perche' qui l'aggiornamento non e' in unita' di griglia ternaria, e
+        // weightDecay a 0 perche' far decadere una scala verso zero
+        // spegnerebbe il gruppo.
+        if (state.scaleCount != 0) {
+            denseAdamKernel<<<gridFor(state.scaleCount), kBlockSize>>>(
+                state.weight->scales(), state.scaleFirstMoment.as<float>(),
+                state.scaleSecondMoment.as<float>(), state.scaleAccumulator.as<float>(), state.scaleCount,
+                options_.beta1, options_.beta2, bias1, bias2, options_.eps, options_.learningRate,
+                0.0F, state.scaleRms, deviceStats_.as<DeviceStepStats>());
+            BLACKFORGE_CUDA_CHECK(cudaGetLastError());
+        }
         state.touched = false;
     }
     for (auto& [name, state] : denseStates_) {
@@ -728,6 +807,12 @@ void LowRankProjectedOptimizer::serializeState(std::ostream& out) const {
         writeDeviceVector(out, state.firstMoment);
         writeDeviceVector(out, state.secondMoment);
         writeScalar<std::uint64_t>(out, 0);  // CPU-compatible empty consolidation residual.
+        // Momenti Adam delle scale: senza, una ripresa da checkpoint
+        // ripartirebbe con lo slancio azzerato e non riprodurrebbe il run
+        // ininterrotto. Stesso ordine del formato CPU.
+        writeDeviceVector(out, state.scaleFirstMoment);
+        writeDeviceVector(out, state.scaleSecondMoment);
+        writeScalar<float>(out, state.scaleRms);
     }
     writeScalar<std::uint32_t>(out, static_cast<std::uint32_t>(denseStates_.size()));
     for (const auto& [name, state] : denseStates_) {
@@ -755,6 +840,10 @@ void LowRankProjectedOptimizer::deserializeState(std::istream& in) {
         readDeviceVector(in, state.secondMoment);
         const std::size_t residualCount = static_cast<std::size_t>(readScalar<std::uint64_t>(in));
         if (residualCount != 0) throw std::runtime_error("CUDA optimizer state: consolidation residual is unsupported");
+        readDeviceVector(in, state.scaleFirstMoment);
+        readDeviceVector(in, state.scaleSecondMoment);
+        state.scaleRms = readScalar<float>(in);
+        BLACKFORGE_CUDA_CHECK(cudaMemset(state.scaleAccumulator.data(), 0, state.scaleAccumulator.bytes()));
         BLACKFORGE_CUDA_CHECK(cudaMemset(state.accumulator.data(), 0, state.accumulator.bytes()));
         state.touched = false;
     }

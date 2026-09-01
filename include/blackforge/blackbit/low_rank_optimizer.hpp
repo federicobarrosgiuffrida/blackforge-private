@@ -209,8 +209,22 @@ private:
         std::vector<float> secondMoment;  // rank x cols
         std::vector<float> accumulator;   // rank x cols, azzerato a ogni passo
         std::vector<float> residual;      // rank x cols, solo se la consolidazione e' attiva
+
+        // Le scale per gruppo sono l'unica parte continua di un peso
+        // ternario. Senza il loro gradiente ogni peso resta inchiodato ai
+        // tre valori decisi all'inizializzazione: e' esattamente cio' che
+        // impediva al modello di adattarsi ai dati.
+        std::vector<float> scaleFirstMoment;   // rows x groupsPerRow
+        std::vector<float> scaleSecondMoment;  // rows x groupsPerRow
+        std::vector<float> scaleAccumulator;   // rows x groupsPerRow
+        float scaleRms = 1.0F;
         bool touched = false;
     };
+
+    // Dichiarata dopo TernaryState: prima della definizione, 'struct
+    // TernaryState' nella firma avrebbe introdotto un tipo nuovo invece di
+    // riferirsi a quello annidato.
+    void applyScaleUpdate(TernaryState& state);
 
     struct DenseState {
         std::vector<float>* values = nullptr;

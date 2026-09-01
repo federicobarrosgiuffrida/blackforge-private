@@ -76,6 +76,18 @@ private:
         Buffer firstMoment;
         Buffer secondMoment;
         Buffer accumulator;
+        // Le scale per gruppo sono l'unica parte continua di un peso
+        // ternario: senza di loro ogni peso resta inchiodato ai tre valori
+        // decisi all'inizializzazione e la rete non puo' regolare
+        // l'ampiezza di nessun layer. Sono una ogni groupSize pesi, quindi
+        // il loro stato Adam costa 1/groupSize di uno stato denso.
+        Buffer scaleFirstMoment;
+        Buffer scaleSecondMoment;
+        Buffer scaleAccumulator;
+        std::size_t scaleCount = 0;
+        // Magnitudine tipica delle scale, misurata all'inizializzazione:
+        // rende l'aggiornamento relativo invece che assoluto.
+        float scaleRms = 1.0F;
         bool touched = false;
     };
 

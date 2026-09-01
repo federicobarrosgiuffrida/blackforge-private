@@ -1,5 +1,7 @@
 #include <gtest/gtest.h>
 
+#include <algorithm>
+#include <cmath>
 #include <cstddef>
 #include <vector>
 
@@ -65,7 +67,19 @@ TEST(CudaBlackBitOptimizerTest, MatchesCpuProjectedUpdateForDeterministicStep) {
     const bb::TernaryTensor downloaded = gpuWeight.download();
 
     EXPECT_EQ(downloaded.packedWords(), cpuWeight.packedWords());
-    EXPECT_EQ(downloaded.scales(), cpuWeight.scales());
+    // Le scale sono ora addestrate, quindi non sono piu' costanti: sono
+    // valori continui prodotti da due riduzioni con ordini di somma diversi
+    // (riduzione warp su GPU, ciclo sequenziale su CPU). L'uguaglianza
+    // esatta valeva solo finche' restavano ferme al valore iniziale; qui la
+    // proprieta' vera e' che i due percorsi calcolino lo stesso
+    // aggiornamento, a meno dell'arrotondamento. I trit, che sono interi,
+    // restano confrontati per uguaglianza esatta sopra.
+    ASSERT_EQ(downloaded.scales().size(), cpuWeight.scales().size());
+    for (std::size_t i = 0; i < downloaded.scales().size(); ++i) {
+        EXPECT_NEAR(downloaded.scales()[i], cpuWeight.scales()[i],
+                    1e-6F * std::max(1.0F, std::abs(cpuWeight.scales()[i])))
+            << "scala " << i;
+    }
     EXPECT_EQ(gpu.stats().lastStep.flips, cpu.stats().ternaryFlips);
     EXPECT_EQ(gpu.stats().lastStep.positiveFlips + gpu.stats().lastStep.negativeFlips,
               gpu.stats().lastStep.flips);
