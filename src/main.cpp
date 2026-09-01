@@ -6,6 +6,7 @@
 #include <fstream>
 #include <iostream>
 #include <sstream>
+#include <random>
 #include <string>
 #include <vector>
 
@@ -61,6 +62,9 @@ void printUsage() {
               << "                                  BUFFER. Preset: tiny, small, medium, 9b-a3b; oppure --config\n"
               << "  inspect <file>     Mostra un riepilogo dei modelli (input, pipeline, numero di parametri)\n"
               << "  devices            Elenca i dispositivi di calcolo disponibili (CPU e GPU CUDA)\n"
+              << "  blackbit-generate  Genera testo da un checkpoint BlackBit (richiede --from-checkpoint e\n"
+              << "                     --tokenizer; opzionali --prompt, --max-new-tokens, --temperature).\n"
+              << "                     Temperatura 0 sceglie sempre il token piu' probabile\n"
               << "  tokenizer-train <corpus.txt>   Addestra un tokenizer BPE byte-level sul corpus dato\n"
               << "                                  (richiede --vocab-size e --output)\n"
               << "  tokenizer-encode <tok.bftok> <testo.txt>   Codifica un file di testo, stampa gli id di token\n"
@@ -937,6 +941,89 @@ int runBlackBitBenchmark(const std::string& configPath, const std::string& prese
     }
 }
 
+
+// Genera testo da un checkpoint BlackBit.
+//
+// Il motore di addestramento sapeva solo addestrare: non esisteva alcun modo
+// di far produrre una parola a un modello BlackBit, e ogni giudizio sulla sua
+// qualita' passava dalla loss, che e' un indicatore indiretto. Un modello puo'
+// avere una loss decorosa e generare ripetizioni inutilizzabili.
+//
+// Nessuna cache delle chiavi e dei valori: a ogni token si rifa' il forward
+// sull'intera finestra. E' uno spreco irrilevante su un modello da 60 M e
+// risparmia la parte piu' delicata da scrivere. Se servira' velocita' vera si
+// aggiunge dopo.
+int runBlackBitGenerate(const std::string& checkpointPath, const std::string& tokenizerPath,
+                         const std::string& prompt, std::size_t maxNewTokens, float temperature,
+                         unsigned int seed) {
+    try {
+        const blackforge::blackbit::BlackBitConfig config =
+            blackforge::blackbit::readCheckpointConfig(checkpointPath);
+        blackforge::blackbit::BlackBitModel model(config);
+        const blackforge::blackbit::BlackBitTrainingState state =
+            blackforge::blackbit::loadCheckpoint(checkpointPath, model);
+        const blackforge::tokenizer::Tokenizer tok = blackforge::tokenizer::loadTokenizer(tokenizerPath);
+
+        std::cerr << "checkpoint al passo " << state.step << ", " << state.tokensSeen
+                   << " token visti\n";
+
+        const std::vector<std::uint32_t> encoded = tok.encode(prompt);
+        std::vector<int> tokens;
+        tokens.reserve(encoded.size() + maxNewTokens);
+        for (std::uint32_t id : encoded) tokens.push_back(static_cast<int>(id));
+        if (tokens.empty()) {
+            std::cerr << "errore: il prompt e' vuoto dopo la tokenizzazione\n";
+            return 2;
+        }
+
+        std::mt19937 rng(seed);
+        const std::size_t generati = maxNewTokens;
+        for (std::size_t n = 0; n < generati; ++n) {
+            const std::size_t seq = std::min(tokens.size(), config.maxSeqLen);
+            const std::vector<int> finestra(tokens.end() - static_cast<std::ptrdiff_t>(seq), tokens.end());
+            blackforge::blackbit::BlackBitForwardCache cache;
+            const blackforge::runtime::Tensor hidden = model.forwardHidden(finestra, 1, seq, cache);
+            const blackforge::runtime::Tensor logits = model.logits(hidden);
+            const std::size_t vocab = config.vocabSize;
+            const float* riga = logits.data().data() + (seq - 1) * vocab;
+
+            int scelto = 0;
+            if (temperature <= 0.0F) {
+                float migliore = riga[0];
+                for (std::size_t v = 1; v < vocab; ++v) {
+                    if (riga[v] > migliore) { migliore = riga[v]; scelto = static_cast<int>(v); }
+                }
+            } else {
+                // softmax con temperatura, stabilizzato sottraendo il massimo
+                float massimo = riga[0];
+                for (std::size_t v = 1; v < vocab; ++v) massimo = std::max(massimo, riga[v]);
+                double somma = 0.0;
+                std::vector<double> pesi(vocab);
+                for (std::size_t v = 0; v < vocab; ++v) {
+                    pesi[v] = std::exp(static_cast<double>((riga[v] - massimo) / temperature));
+                    somma += pesi[v];
+                }
+                std::uniform_real_distribution<double> uniforme(0.0, somma);
+                double soglia = uniforme(rng);
+                for (std::size_t v = 0; v < vocab; ++v) {
+                    soglia -= pesi[v];
+                    if (soglia <= 0.0) { scelto = static_cast<int>(v); break; }
+                }
+            }
+            tokens.push_back(scelto);
+        }
+
+        std::vector<std::uint32_t> uscita;
+        uscita.reserve(tokens.size());
+        for (int id : tokens) uscita.push_back(static_cast<std::uint32_t>(id));
+        std::cout << tok.decode(uscita) << "\n";
+        return 0;
+    } catch (const std::exception& e) {
+        std::cerr << "errore: " << e.what() << "\n";
+        return 1;
+    }
+}
+
 int runBlackBitTraining(const std::string& configPath, const std::string& presetName,
                         const std::string& datasetPath, const std::string& tokenizerPath,
                         std::size_t microBatch, std::size_t steps,
@@ -1249,6 +1336,7 @@ int main(int argc, char** argv) {
     std::size_t checkpointEvery = 0;
     bool errorFeedback = false;
     float latentClamp = 0.0F;
+    float temperature = 0.0F;
     std::string recomputeMode;
     bool dryRun = false;
     bool instantiateOnly = false;
@@ -1382,6 +1470,12 @@ int main(int argc, char** argv) {
                 return 2;
             }
             maxVramMb = static_cast<std::size_t>(std::strtoull(args[++i].c_str(), nullptr, 10));
+        } else if (args[i] == "--temperature") {
+            if (i + 1 >= args.size()) {
+                std::cerr << "errore: '--temperature' richiede un valore\n";
+                return 2;
+            }
+            temperature = std::strtof(args[++i].c_str(), nullptr);
         } else if (args[i] == "--latent-clamp") {
             if (i + 1 >= args.size()) {
                 std::cerr << "errore: '--latent-clamp' richiede un valore\n";
@@ -1525,6 +1619,15 @@ int main(int argc, char** argv) {
         printDevices();
         return 0;
     }
+    if (command == "blackbit-generate") {
+        if (fromCheckpoint.empty() || tokenizerPath.empty()) {
+            std::cerr << "errore: 'blackbit-generate' richiede --from-checkpoint e --tokenizer\n";
+            return 2;
+        }
+        return runBlackBitGenerate(fromCheckpoint, tokenizerPath, prompt,
+                                    maxNewTokens == 0 ? 50 : maxNewTokens, temperature, 42U);
+    }
+
     if (command == "tokenizer-train") {
         if (positional.empty()) {
             std::cerr << "errore: comando 'tokenizer-train' richiede il percorso di un corpus di testo\n";
