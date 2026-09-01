@@ -412,10 +412,20 @@ __global__ void updatePackedKernel(std::uint32_t* packed, float* residual, std::
             target = static_cast<float>(oldTrit) + update;
             newTrit = stochasticRoundToTrit(target, stepSeed, flat);
         } else {
-            target = static_cast<float>(oldTrit) + residual[flat] + update;
-            const float rounded = rintf(target);
+            // Il peso latente va limitato a [-1, +1] PRIMA di arrotondare.
+            // Senza il limite, un peso che spinge sempre nella stessa
+            // direzione fa crescere il residuo senza fine: il trit resta
+            // incollato alla saturazione e quel peso smette di imparare, in
+            // silenzio e senza che la loss lo segnali subito.
+            //
+            // Col limite il residuo resta per costruzione in [-0,5, +0,5],
+            // che e' anche cio' che ne rende possibile la memorizzazione a
+            // pochi bit.
+            const float latent = fminf(fmaxf(static_cast<float>(oldTrit) + residual[flat] + update, -1.0F), 1.0F);
+            target = latent;
+            const float rounded = rintf(latent);
             newTrit = rounded < -1.0F ? -1 : (rounded > 1.0F ? 1 : static_cast<int>(rounded));
-            residual[flat] = target - static_cast<float>(newTrit);
+            residual[flat] = latent - static_cast<float>(newTrit);
         }
         trits[slot] = newTrit;
         ++elements;
