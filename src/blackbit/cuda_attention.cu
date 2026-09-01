@@ -117,6 +117,10 @@ __global__ __launch_bounds__(kHeadDim128Threads) void gqaForward128Kernel(
     }
 }
 
+// Parametrico in kHeadDim: ogni lane possiede kHeadDim/32 dimensioni, quindi
+// 2 per headDim 64 e 4 per headDim 128. Il modello 9B usa 128, i modelli
+// piccoli 64, e prima solo il primo prendeva questa strada.
+//
 // Il kernel per riga singola spende, per OGNI coppia (query, chiave), una
 // riduzione di blocco su 128 thread: due __syncthreads e un giro in memoria
 // condivisa per un solo prodotto scalare. Con seq=512 sono 2,5e7 riduzioni
@@ -145,7 +149,8 @@ __device__ __forceinline__ float warpAllSum(float value) {
 constexpr int kRowsPerWarpBlock = 4;
 constexpr int kWarpBlockThreads = kRowsPerWarpBlock * kCudaWarpSize;
 
-__global__ __launch_bounds__(kWarpBlockThreads) void gqaForward128WarpKernel(
+template <int kHeadDim>
+__global__ __launch_bounds__(kWarpBlockThreads) void gqaForwardWarpKernel(
     float* output, float* rowMax, float* rowSum, const float* query, const float* key,
     const float* value, std::size_t batch, std::size_t seq, std::size_t heads,
     std::size_t kvHeads, std::size_t headsPerGroup, float scale) {
@@ -158,12 +163,12 @@ __global__ __launch_bounds__(kWarpBlockThreads) void gqaForward128WarpKernel(
     const std::size_t head = (row / seq) % heads;
     const std::size_t batchIndex = row / (seq * heads);
     const std::size_t kvHead = head / headsPerGroup;
-    const std::size_t queryOffset = ((batchIndex * seq + queryPosition) * heads + head) * 128;
+    const std::size_t queryOffset = ((batchIndex * seq + queryPosition) * heads + head) * kHeadDim;
 
-    float queryValue[4];
-    float accumulator[4];
+    float queryValue[kHeadDim / kCudaWarpSize];
+    float accumulator[kHeadDim / kCudaWarpSize];
 #pragma unroll
-    for (int i = 0; i < 4; ++i) {
+    for (int i = 0; i < kHeadDim / kCudaWarpSize; ++i) {
         queryValue[i] = query[queryOffset + lane + i * kCudaWarpSize];
         accumulator[i] = 0.0F;
     }
@@ -171,11 +176,11 @@ __global__ __launch_bounds__(kWarpBlockThreads) void gqaForward128WarpKernel(
     float runningMaximum = -3.402823466e+38F;
     float runningTotal = 0.0F;
     for (std::size_t keyPosition = 0; keyPosition <= queryPosition; ++keyPosition) {
-        const std::size_t kvOffset = ((batchIndex * seq + keyPosition) * kvHeads + kvHead) * 128;
+        const std::size_t kvOffset = ((batchIndex * seq + keyPosition) * kvHeads + kvHead) * kHeadDim;
         float partial = 0.0F;
-        float valueValue[4];
+        float valueValue[kHeadDim / kCudaWarpSize];
 #pragma unroll
-        for (int i = 0; i < 4; ++i) {
+        for (int i = 0; i < kHeadDim / kCudaWarpSize; ++i) {
             partial = fmaf(queryValue[i], key[kvOffset + lane + i * kCudaWarpSize], partial);
             valueValue[i] = value[kvOffset + lane + i * kCudaWarpSize];
         }
@@ -187,13 +192,13 @@ __global__ __launch_bounds__(kWarpBlockThreads) void gqaForward128WarpKernel(
         runningTotal = fmaf(runningTotal, correction, weight);
         runningMaximum = nextMaximum;
 #pragma unroll
-        for (int i = 0; i < 4; ++i) {
+        for (int i = 0; i < kHeadDim / kCudaWarpSize; ++i) {
             accumulator[i] = fmaf(weight, valueValue[i], accumulator[i] * correction);
         }
     }
 
 #pragma unroll
-    for (int i = 0; i < 4; ++i) {
+    for (int i = 0; i < kHeadDim / kCudaWarpSize; ++i) {
         output[queryOffset + lane + i * kCudaWarpSize] = accumulator[i] / runningTotal;
     }
     if (lane == 0) {
@@ -318,7 +323,8 @@ __device__ __forceinline__ void warpAllSumPair(float& first, float& second) {
     }
 }
 
-__global__ __launch_bounds__(kWarpBlockThreads) void gqaBackward128WarpKernel(
+template <int kHeadDim>
+__global__ __launch_bounds__(kWarpBlockThreads) void gqaBackwardWarpKernel(
     float* gradQuery, float* gradKey, float* gradValue, const float* query, const float* key,
     const float* value, const float* output, const float* gradOutput, const float* rowMax,
     const float* rowSum, std::size_t batch, std::size_t seq, std::size_t heads,
@@ -332,14 +338,14 @@ __global__ __launch_bounds__(kWarpBlockThreads) void gqaBackward128WarpKernel(
     const std::size_t head = (row / seq) % heads;
     const std::size_t batchIndex = row / (seq * heads);
     const std::size_t kvHead = head / headsPerGroup;
-    const std::size_t queryOffset = ((batchIndex * seq + queryPosition) * heads + head) * 128;
+    const std::size_t queryOffset = ((batchIndex * seq + queryPosition) * heads + head) * kHeadDim;
 
-    float queryValue[4];
-    float gradOutputValue[4];
-    float queryGradient[4];
+    float queryValue[kHeadDim / kCudaWarpSize];
+    float gradOutputValue[kHeadDim / kCudaWarpSize];
+    float queryGradient[kHeadDim / kCudaWarpSize];
     float correctionPartial = 0.0F;
 #pragma unroll
-    for (int i = 0; i < 4; ++i) {
+    for (int i = 0; i < kHeadDim / kCudaWarpSize; ++i) {
         const std::size_t offset = queryOffset + lane + i * kCudaWarpSize;
         queryValue[i] = query[offset];
         gradOutputValue[i] = gradOutput[offset];
@@ -351,13 +357,13 @@ __global__ __launch_bounds__(kWarpBlockThreads) void gqaBackward128WarpKernel(
     const float rowTotal = rowSum[row];
 
     for (std::size_t keyPosition = 0; keyPosition <= queryPosition; ++keyPosition) {
-        const std::size_t kvOffset = ((batchIndex * seq + keyPosition) * kvHeads + kvHead) * 128;
-        float keyValue[4];
-        float valueValue[4];
+        const std::size_t kvOffset = ((batchIndex * seq + keyPosition) * kvHeads + kvHead) * kHeadDim;
+        float keyValue[kHeadDim / kCudaWarpSize];
+        float valueValue[kHeadDim / kCudaWarpSize];
         float dot = 0.0F;
         float probabilityGradient = 0.0F;
 #pragma unroll
-        for (int i = 0; i < 4; ++i) {
+        for (int i = 0; i < kHeadDim / kCudaWarpSize; ++i) {
             const std::size_t offset = kvOffset + lane + i * kCudaWarpSize;
             keyValue[i] = key[offset];
             valueValue[i] = value[offset];
@@ -368,7 +374,7 @@ __global__ __launch_bounds__(kWarpBlockThreads) void gqaBackward128WarpKernel(
         const float probability = expf(dot * scale - rowMaximum) / rowTotal;
         const float gradScore = probability * (probabilityGradient - correctionValue) * scale;
 #pragma unroll
-        for (int i = 0; i < 4; ++i) {
+        for (int i = 0; i < kHeadDim / kCudaWarpSize; ++i) {
             const std::size_t offset = kvOffset + lane + i * kCudaWarpSize;
             queryGradient[i] = fmaf(gradScore, keyValue[i], queryGradient[i]);
             atomicAdd(gradKey + offset, gradScore * queryValue[i]);
@@ -377,7 +383,7 @@ __global__ __launch_bounds__(kWarpBlockThreads) void gqaBackward128WarpKernel(
     }
 
 #pragma unroll
-    for (int i = 0; i < 4; ++i) {
+    for (int i = 0; i < kHeadDim / kCudaWarpSize; ++i) {
         gradQuery[queryOffset + lane + i * kCudaWarpSize] = queryGradient[i];
     }
 }
@@ -480,9 +486,14 @@ Tensor GqaAttention::forward(const Tensor& input, AttentionCache& cache) const {
     cache.rowSum = Tensor({batch, config_.numHeads, seq}, MemoryArena::Attention);
     const std::size_t rows = batch * config_.numHeads * seq;
     const float scale = 1.0F / std::sqrt(static_cast<float>(config_.headDim));
+    const std::size_t warpBlocks = (rows + kRowsPerWarpBlock - 1) / kRowsPerWarpBlock;
     if (config_.headDim == 128) {
-        const std::size_t warpBlocks = (rows + kRowsPerWarpBlock - 1) / kRowsPerWarpBlock;
-        gqaForward128WarpKernel<<<static_cast<unsigned int>(warpBlocks), kWarpBlockThreads>>>(
+        gqaForwardWarpKernel<128><<<static_cast<unsigned int>(warpBlocks), kWarpBlockThreads>>>(
+            cache.attnOutput.data(), cache.rowMax.data(), cache.rowSum.data(), cache.query.data(),
+            cache.key.data(), cache.value.data(), batch, seq, config_.numHeads, config_.numKvHeads,
+            config_.headsPerKvGroup(), scale);
+    } else if (config_.headDim == 64) {
+        gqaForwardWarpKernel<64><<<static_cast<unsigned int>(warpBlocks), kWarpBlockThreads>>>(
             cache.attnOutput.data(), cache.rowMax.data(), cache.rowSum.data(), cache.query.data(),
             cache.key.data(), cache.value.data(), batch, seq, config_.numHeads, config_.numKvHeads,
             config_.headsPerKvGroup(), scale);
@@ -506,9 +517,15 @@ Tensor GqaAttention::backward(const Tensor& input, const Tensor& gradOutput, con
     Tensor gradValue = Tensor::zeros(cache.value.shape(), MemoryArena::Attention);
     const std::size_t rows = batch * config_.numHeads * seq;
     const float scale = 1.0F / std::sqrt(static_cast<float>(config_.headDim));
+    const std::size_t warpBlocks = (rows + kRowsPerWarpBlock - 1) / kRowsPerWarpBlock;
     if (config_.headDim == 128) {
-        const std::size_t warpBlocks = (rows + kRowsPerWarpBlock - 1) / kRowsPerWarpBlock;
-        gqaBackward128WarpKernel<<<static_cast<unsigned int>(warpBlocks), kWarpBlockThreads>>>(
+        gqaBackwardWarpKernel<128><<<static_cast<unsigned int>(warpBlocks), kWarpBlockThreads>>>(
+            gradQuery.data(), gradKey.data(), gradValue.data(), cache.query.data(), cache.key.data(),
+            cache.value.data(), cache.attnOutput.data(), gradAttnOutput.data(), cache.rowMax.data(),
+            cache.rowSum.data(), batch, seq, config_.numHeads, config_.numKvHeads,
+            config_.headsPerKvGroup(), scale);
+    } else if (config_.headDim == 64) {
+        gqaBackwardWarpKernel<64><<<static_cast<unsigned int>(warpBlocks), kWarpBlockThreads>>>(
             gradQuery.data(), gradKey.data(), gradValue.data(), cache.query.data(), cache.key.data(),
             cache.value.data(), cache.attnOutput.data(), gradAttnOutput.data(), cache.rowMax.data(),
             cache.rowSum.data(), batch, seq, config_.numHeads, config_.numKvHeads,
