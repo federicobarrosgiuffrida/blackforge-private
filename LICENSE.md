@@ -1,5 +1,12 @@
 # PolyForm Noncommercial License 1.0.0
 
+Required Notice: Copyright 2026 Federico Barros
+<https://github.com/federicobarrosgiuffrida/blackforge>
+
+BlackForge e BlackBit sono distribuiti soltanto per scopi non commerciali,
+secondo i termini che seguono. Per una licenza d'uso commerciale, contattare
+il titolare del copyright.
+
 <https://polyformproject.org/licenses/noncommercial/1.0.0>
 
 ## Acceptance
