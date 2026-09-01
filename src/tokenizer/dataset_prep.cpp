@@ -9,9 +9,13 @@ namespace blackforge::tokenizer {
 
 std::size_t buildLanguageModelDataset(const Tokenizer& tok, const std::string& corpus, std::size_t seqLen,
                                        const std::string& outputPath) {
-    std::vector<std::uint32_t> ids = tok.encode(corpus);
+    return buildLanguageModelDatasetFromIds(tok.encode(corpus), seqLen, outputPath);
+}
+
+std::size_t buildLanguageModelDatasetFromIds(const std::vector<std::uint32_t>& ids, std::size_t seqLen,
+                                              const std::string& outputPath) {
     if (ids.size() < seqLen + 1) {
-        throw std::invalid_argument("buildLanguageModelDataset: il corpus tokenizzato ha solo " +
+        throw std::invalid_argument("buildLanguageModelDatasetFromIds: il corpus tokenizzato ha solo " +
                                      std::to_string(ids.size()) + " token, ne servono almeno " +
                                      std::to_string(seqLen + 1) + " (seqLen + 1) per una singola finestra");
     }

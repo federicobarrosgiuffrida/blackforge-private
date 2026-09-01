@@ -2,6 +2,7 @@
 
 #include <cstddef>
 #include <string>
+#include <vector>
 
 #include "blackforge/tokenizer/tokenizer.hpp"
 
@@ -33,6 +34,11 @@ namespace blackforge::tokenizer {
 // corpora molto grandi e' un limite esplicito, che la milestone di
 // caricamento dati efficiente (streaming/shard) rimuovera'; questa
 // funzione non e' pensata per corpora da gigabyte cosi' come e' oggi.
+// Variante che riceve i token gia' codificati, per i corpus troppo grandi
+// da tenere in memoria come stringa.
+std::size_t buildLanguageModelDatasetFromIds(const std::vector<std::uint32_t>& ids, std::size_t seqLen,
+                                              const std::string& outputPath);
+
 std::size_t buildLanguageModelDataset(const Tokenizer& tok, const std::string& corpus, std::size_t seqLen,
                                        const std::string& outputPath);
 

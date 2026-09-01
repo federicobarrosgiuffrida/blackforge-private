@@ -726,13 +726,53 @@ int runTokenizerEncode(const std::string& tokenizerPath, const std::string& text
     return 0;
 }
 
+// Legge il corpus a pezzi e lo codifica man mano, invece di caricarlo tutto
+// in memoria.
+//
+// readFile() accumula in un ostringstream e poi copia il risultato in una
+// stringa: il picco e' il doppio della dimensione del file. Su un corpus da
+// 11,5 GB sono 23 GB, e quando la memoria non basta ostringstream smette di
+// accumulare SENZA lanciare eccezioni: si ottiene un corpus troncato e
+// nessun errore. Un addestramento lanciato su quel dataset userebbe una
+// frazione del testo senza che nulla lo segnali.
+//
+// I pezzi sono tagliati sull'ultimo a capo, mai a meta' riga: la
+// pre-tokenizzazione lavora per parole, quindi spezzare fra due righe non
+// cambia il risultato rispetto alla codifica del testo intero.
+bool encodeCorpusStreaming(const std::string& path, const blackforge::tokenizer::Tokenizer& tok,
+                            std::vector<std::uint32_t>& ids) {
+    std::ifstream file(path, std::ios::in | std::ios::binary);
+    if (!file) {
+        return false;
+    }
+    constexpr std::size_t kChunkBytes = 64ULL * 1024ULL * 1024ULL;
+    std::string buffer;
+    std::string chunk(kChunkBytes, '\0');
+    while (file) {
+        file.read(chunk.data(), static_cast<std::streamsize>(kChunkBytes));
+        const std::streamsize got = file.gcount();
+        if (got <= 0) {
+            break;
+        }
+        buffer.append(chunk.data(), static_cast<std::size_t>(got));
+        const std::size_t cut = buffer.find_last_of('\n');
+        if (cut == std::string::npos) {
+            continue;  // nessuna riga completa: si accumula ancora
+        }
+        const std::string head = buffer.substr(0, cut + 1);
+        buffer.erase(0, cut + 1);
+        const std::vector<std::uint32_t> part = tok.encode(head);
+        ids.insert(ids.end(), part.begin(), part.end());
+    }
+    if (!buffer.empty()) {
+        const std::vector<std::uint32_t> part = tok.encode(buffer);
+        ids.insert(ids.end(), part.begin(), part.end());
+    }
+    return true;
+}
+
 int runDatasetBuild(const std::string& corpusPath, const std::string& tokenizerPath, std::size_t seqLen,
                      const std::string& outputPath, bool mlm, float maskProb) {
-    std::string corpus;
-    if (!readFile(corpusPath, corpus)) {
-        std::cerr << "errore: impossibile leggere il corpus '" << corpusPath << "'\n";
-        return 2;
-    }
     if (seqLen == 0) {
         std::cerr << "errore: '--seq-len' richiede un intero positivo\n";
         return 2;
@@ -744,8 +784,19 @@ int runDatasetBuild(const std::string& corpusPath, const std::string& tokenizerP
 
     try {
         blackforge::tokenizer::Tokenizer tok = blackforge::tokenizer::loadTokenizer(tokenizerPath);
+        std::vector<std::uint32_t> ids;
+        if (!encodeCorpusStreaming(corpusPath, tok, ids)) {
+            std::cerr << "errore: impossibile leggere il corpus '" << corpusPath << "'\n";
+            return 2;
+        }
+        std::cout << "Corpus codificato: " << ids.size() << " token\n";
         std::size_t numExamples;
         if (mlm) {
+            std::string corpus;
+            if (!readFile(corpusPath, corpus)) {
+                std::cerr << "errore: impossibile leggere il corpus\n";
+                return 2;
+            }
             numExamples = blackforge::tokenizer::buildMaskedLanguageModelDataset(tok, corpus, seqLen, maskProb,
                                                                                    /*seed=*/42, outputPath);
             std::cout << "Dataset MLM costruito: " << numExamples << " esempi (seqLen=" << seqLen
@@ -753,7 +804,7 @@ int runDatasetBuild(const std::string& corpusPath, const std::string& tokenizerP
                        << "). Allena con 'loss cross_entropy_masked' e 'bidirectional_attention' nella "
                           "pipeline.\n";
         } else {
-            numExamples = blackforge::tokenizer::buildLanguageModelDataset(tok, corpus, seqLen, outputPath);
+            numExamples = blackforge::tokenizer::buildLanguageModelDatasetFromIds(ids, seqLen, outputPath);
             std::cout << "Dataset costruito: " << numExamples << " esempi (seqLen=" << seqLen
                        << ", vocabolario=" << tok.vocabSize() << ")\n";
         }
