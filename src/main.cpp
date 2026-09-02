@@ -65,6 +65,9 @@ void printUsage() {
               << "  blackbit-generate  Genera testo da un checkpoint BlackBit (richiede --from-checkpoint e\n"
               << "                     --tokenizer; opzionali --prompt, --max-new-tokens, --temperature).\n"
               << "                     Temperatura 0 sceglie sempre il token piu' probabile\n"
+              << "  blackbit-eval      Valuta un checkpoint su dati mai visti e riporta loss, perplexity e bit\n"
+              << "                     per byte (richiede --from-checkpoint, --dataset e --device cuda;\n"
+              << "                     --bytes-per-token abilita i bit per byte, --max-examples limita)\n"
               << "  tokenizer-train <corpus.txt>   Addestra un tokenizer BPE byte-level sul corpus dato\n"
               << "                                  (richiede --vocab-size e --output)\n"
               << "  tokenizer-encode <tok.bftok> <testo.txt>   Codifica un file di testo, stampa gli id di token\n"
@@ -117,6 +120,9 @@ void printUsage() {
               << "  --max-vram-mb N    Budget di memoria: superarlo e' un errore diagnosticato prima di allocare "
                  "(solo 'benchmark blackbit', default 7800, 0 = nessun limite)\n"
               << "  --optimizer-rank N Rango del sottospazio dell'ottimizzatore (solo 'benchmark blackbit')\n"
+              << "  --latent-decay F   Decadimento applicato al peso latente a ogni passo con --error-feedback.\n"
+              << "                     Impedisce ai pesi di accumularsi al bordo del limite, dove smettono di\n"
+              << "                     rispondere al gradiente (default 0)\n"
               << "  --latent-clamp F   Ampiezza del limite sul peso latente con --error-feedback (default 1).\n"
               << "                     Valori maggiori restituiscono inerzia contro il rumore del gradiente,\n"
               << "                     tenendo comunque il residuo limitato\n"
@@ -953,6 +959,50 @@ int runBlackBitBenchmark(const std::string& configPath, const std::string& prese
 // sull'intera finestra. E' uno spreco irrilevante su un modello da 60 M e
 // risparmia la parte piu' delicata da scrivere. Se servira' velocita' vera si
 // aggiunge dopo.
+int runBlackBitEval(const std::string& checkpointPath, const std::string& datasetPath,
+                     std::size_t microBatch, std::size_t maxExamples, double bytesPerToken,
+                     std::size_t maxVramMb, const std::string& device) {
+#if BLACKFORGE_HAS_CUDA
+    try {
+        DeviceSpec spec;
+        std::string deviceError;
+        if (!parseDeviceSpec(device, spec, deviceError) || !spec.isCuda) {
+            std::cerr << "errore: 'blackbit-eval' richiede --device cuda o cuda:N\n";
+            return 2;
+        }
+        blackforge::blackbit::cuda::EvalOptions options;
+        options.checkpoint = checkpointPath;
+        options.datasetPath = datasetPath;
+        options.microBatch = microBatch == 0 ? 16 : microBatch;
+        options.maxExamples = maxExamples;
+        options.bytesPerToken = bytesPerToken;
+        options.maxVramMb = maxVramMb;
+
+        const auto r = blackforge::blackbit::cuda::evaluate(options, spec.cudaIndex, &std::cerr);
+        std::cerr << "                                        \r";
+
+        std::cout << std::fixed << std::setprecision(4)
+                  << "passo " << r.checkpointStep
+                  << "  token_visti " << r.checkpointTokens
+                  << "  loss " << r.loss
+                  << "  ppl " << std::setprecision(2) << r.perplexity;
+        if (r.bitsPerByte > 0.0) std::cout << "  bpb " << std::setprecision(4) << r.bitsPerByte;
+        std::cout << "  esempi " << r.examples
+                  << "  token " << r.scoredTokens
+                  << "  secondi " << std::setprecision(1) << r.seconds << "\n";
+        return 0;
+    } catch (const std::exception& e) {
+        std::cerr << "errore: " << e.what() << "\n";
+        return 1;
+    }
+#else
+    (void)checkpointPath; (void)datasetPath; (void)microBatch; (void)maxExamples;
+    (void)bytesPerToken; (void)maxVramMb; (void)device;
+    std::cerr << "errore: questa build non include il supporto CUDA\n";
+    return 2;
+#endif
+}
+
 int runBlackBitGenerate(const std::string& checkpointPath, const std::string& tokenizerPath,
                          const std::string& prompt, std::size_t maxNewTokens, float temperature,
                          unsigned int seed) {
@@ -1031,7 +1081,7 @@ int runBlackBitTraining(const std::string& configPath, const std::string& preset
                         const std::string& recomputeMode, const std::string& fromCheckpoint,
                         const std::string& saveCheckpoint, float learningRate,
                         std::size_t warmupSteps, std::size_t scheduleSteps,
-                        std::size_t checkpointEvery, bool errorFeedback, float latentClamp,
+                        std::size_t checkpointEvery, bool errorFeedback, float latentClamp, float latentDecay,
                         const std::string& device) {
 #if BLACKFORGE_HAS_CUDA
     try {
@@ -1059,6 +1109,7 @@ int runBlackBitTraining(const std::string& configPath, const std::string& preset
         options.checkpointEvery = checkpointEvery;
         options.optimizer.errorFeedback = errorFeedback;
         if (latentClamp > 0.0F) options.optimizer.latentClamp = latentClamp;
+        if (latentDecay > 0.0F) options.optimizer.latentDecay = latentDecay;
         if (recomputeMode == "none") {
             options.runtime.recompute = blackforge::blackbit::ActivationRecompute::None;
         } else if (recomputeMode.empty() || recomputeMode == "per-layer") {
@@ -1336,6 +1387,9 @@ int main(int argc, char** argv) {
     std::size_t checkpointEvery = 0;
     bool errorFeedback = false;
     float latentClamp = 0.0F;
+    float latentDecay = 0.0F;
+    double bytesPerToken = 0.0;
+    std::size_t maxExamples = 0;
     float temperature = 0.0F;
     std::string recomputeMode;
     bool dryRun = false;
@@ -1476,6 +1530,24 @@ int main(int argc, char** argv) {
                 return 2;
             }
             temperature = std::strtof(args[++i].c_str(), nullptr);
+        } else if (args[i] == "--bytes-per-token") {
+            if (i + 1 >= args.size()) {
+                std::cerr << "errore: '--bytes-per-token' richiede un valore\n";
+                return 2;
+            }
+            bytesPerToken = std::strtod(args[++i].c_str(), nullptr);
+        } else if (args[i] == "--max-examples") {
+            if (i + 1 >= args.size()) {
+                std::cerr << "errore: '--max-examples' richiede un valore\n";
+                return 2;
+            }
+            maxExamples = static_cast<std::size_t>(std::strtoull(args[++i].c_str(), nullptr, 10));
+        } else if (args[i] == "--latent-decay") {
+            if (i + 1 >= args.size()) {
+                std::cerr << "errore: '--latent-decay' richiede un valore\n";
+                return 2;
+            }
+            latentDecay = std::strtof(args[++i].c_str(), nullptr);
         } else if (args[i] == "--latent-clamp") {
             if (i + 1 >= args.size()) {
                 std::cerr << "errore: '--latent-clamp' richiede un valore\n";
@@ -1579,7 +1651,7 @@ int main(int argc, char** argv) {
             const std::string preset = positional.size() > 1 ? positional[1] : std::string();
             return runBlackBitTraining(configPath, preset, datasetPath, tokenizerPath, microBatch, steps, maxVramMb,
                                        optimizerRank, recomputeMode, fromCheckpoint, saveCheckpointPath, learningRate, warmupSteps,
-                                       scheduleSteps, checkpointEvery, errorFeedback, latentClamp, device);
+                                       scheduleSteps, checkpointEvery, errorFeedback, latentClamp, latentDecay, device);
         }
         return runTrain(positional.front(), fromCheckpoint, saveCheckpointPath, device, devicesList);
     }
@@ -1619,6 +1691,15 @@ int main(int argc, char** argv) {
         printDevices();
         return 0;
     }
+    if (command == "blackbit-eval") {
+        if (fromCheckpoint.empty() || datasetPath.empty()) {
+            std::cerr << "errore: 'blackbit-eval' richiede --from-checkpoint e --dataset\n";
+            return 2;
+        }
+        return runBlackBitEval(fromCheckpoint, datasetPath, microBatch, maxExamples, bytesPerToken,
+                               maxVramMb, device);
+    }
+
     if (command == "blackbit-generate") {
         if (fromCheckpoint.empty() || tokenizerPath.empty()) {
             std::cerr << "errore: 'blackbit-generate' richiede --from-checkpoint e --tokenizer\n";

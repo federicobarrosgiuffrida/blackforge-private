@@ -64,4 +64,36 @@ struct TrainingResult {
 TrainingResult train(const BlackBitConfig& config, const TrainingOptions& options,
                      int device = 0, std::ostream* progress = nullptr);
 
+// Valutazione su dati mai visti.
+//
+// Senza questa, dopo il confine di epoca la loss di addestramento misura
+// memorizzazione e generalizzazione insieme, e le due non si separano piu'.
+struct EvalOptions {
+    std::string datasetPath;
+    std::string checkpoint;
+    std::size_t microBatch = 16;
+    std::size_t maxExamples = 0;   // 0 = tutto lo shard
+    // Byte di testo originale per token, misurato sul corpus di valutazione.
+    // Serve a convertire la loss in bit per byte, che e' l'unica metrica
+    // confrontabile fra modelli con tokenizzatori diversi: i nats per token
+    // dipendono da quanto e' fine la segmentazione, i bit per byte no.
+    double bytesPerToken = 0.0;
+    unsigned int seed = 42;
+    std::size_t maxVramMb = 7800;
+    BlackBitRuntimeOptions runtime;
+};
+
+struct EvalResult {
+    double loss = 0.0;
+    double perplexity = 0.0;
+    double bitsPerByte = 0.0;   // 0 se bytesPerToken non e' stato fornito
+    std::uint64_t scoredTokens = 0;
+    std::size_t examples = 0;
+    std::uint64_t checkpointStep = 0;
+    std::uint64_t checkpointTokens = 0;
+    double seconds = 0.0;
+};
+
+EvalResult evaluate(const EvalOptions& options, int device = 0, std::ostream* progress = nullptr);
+
 }  // namespace blackforge::blackbit::cuda

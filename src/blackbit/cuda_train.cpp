@@ -314,4 +314,71 @@ TrainingResult train(const BlackBitConfig& config, const TrainingOptions& option
     return result;
 }
 
+EvalResult evaluate(const EvalOptions& options, int device, std::ostream* progress) {
+    if (options.checkpoint.empty() || options.datasetPath.empty() || options.microBatch == 0) {
+        throw std::invalid_argument("CUDA BlackBit eval: servono checkpoint, dataset e microbatch positivo");
+    }
+    const BlackBitConfig config = readCheckpointConfig(options.checkpoint);
+    data::Dataset dataset = data::loadDataset(options.datasetPath);
+    if (dataset.inputExampleShape().size() != 1 || dataset.targetExampleShape() != dataset.inputExampleShape()) {
+        throw std::runtime_error("CUDA BlackBit eval: il dataset deve contenere sequenze di rango 1");
+    }
+    const std::size_t seq = dataset.inputExampleShape().front();
+    if (seq > config.maxSeqLen) throw std::runtime_error("CUDA BlackBit eval: sequenza oltre il limite del modello");
+
+    MemoryTelemetry& telemetry = MemoryTelemetry::instance();
+    telemetry.initialize(device, options.maxVramMb == 0 ? 0 : options.maxVramMb * 1024ULL * 1024ULL);
+
+    blackforge::blackbit::BlackBitModel cpuReference(config, options.seed);
+    cpuReference.setComputeDType(ComputeDType::BF16);
+    cpuReference.setRuntimeOptions(options.runtime);
+    BlackBitModel model(cpuReference);
+    const BlackBitTrainingState state = loadCheckpoint(options.checkpoint, model);
+
+    // Il dataset NON viene rimescolato: la valutazione deve dare lo stesso
+    // numero sugli stessi esempi a ogni chiamata, altrimenti confrontare due
+    // checkpoint misura anche la differenza fra i due campioni.
+    std::size_t total = dataset.numExamples();
+    if (options.maxExamples > 0 && options.maxExamples < total) total = options.maxExamples;
+    const std::size_t batches = total / options.microBatch;   // la coda parziale si scarta
+    if (batches == 0) throw std::runtime_error("CUDA BlackBit eval: il dataset non copre un microbatch");
+
+    EvalResult result;
+    result.checkpointStep = state.step;
+    result.checkpointTokens = state.tokensSeen;
+    result.examples = batches * options.microBatch;
+
+    double sommaNats = 0.0;   // pesata sui token effettivamente valutati
+    std::uint64_t scored = 0;
+    const auto inizio = std::chrono::steady_clock::now();
+    for (std::size_t b = 0; b < batches; ++b) {
+        const data::Dataset::Batch batch = dataset.batch(b * options.microBatch, options.microBatch);
+        const std::vector<int> inputs = integerValues(batch.input, config.vocabSize, "input");
+        const std::vector<int> targets = integerValues(batch.target, config.vocabSize, "target");
+        // sink nullo: trainStep calcola la loss in avanti e ritorna prima del
+        // backward, quindi nessun parametro viene toccato.
+        const BlackBitStepResult step = model.trainStep(inputs, targets, options.microBatch, seq, nullptr);
+        if (step.sawNaN || step.sawInf) {
+            throw std::runtime_error("CUDA BlackBit eval: NaN/Inf su '" + step.firstUnstableTensor + "'");
+        }
+        sommaNats += static_cast<double>(step.loss) * static_cast<double>(step.scoredTokens);
+        scored += step.scoredTokens;
+        if (progress != nullptr && (b + 1) % 50 == 0) {
+            *progress << "  valutati " << (b + 1) << "/" << batches << " microbatch\r" << std::flush;
+        }
+    }
+    BLACKFORGE_CUDA_CHECK(cudaDeviceSynchronize());
+    const auto fine = std::chrono::steady_clock::now();
+    result.seconds = std::chrono::duration<double>(fine - inizio).count();
+
+    result.scoredTokens = scored;
+    result.loss = scored == 0 ? 0.0 : sommaNats / static_cast<double>(scored);
+    result.perplexity = std::exp(result.loss);
+    if (options.bytesPerToken > 0.0) {
+        // bit/byte = (nats/token) / (ln2 * byte/token)
+        result.bitsPerByte = result.loss / (0.6931471805599453 * options.bytesPerToken);
+    }
+    return result;
+}
+
 }  // namespace blackforge::blackbit::cuda
