@@ -62,6 +62,16 @@ public:
     void serializeState(std::ostream& out) const;
     void deserializeState(std::istream& in);
 
+    // Residuo della retroazione dell'errore, in coda al checkpoint.
+    //
+    // In coda e con un'etichetta propria, invece che dentro serializeState:
+    // il campo di versione del checkpoint e' condiviso col percorso CPU, e
+    // incrementarlo romperebbe la compatibilita' incrociata. Un blocco
+    // aggiunto in fondo lo leggono solo i binari che lo cercano, e chi non lo
+    // cerca ignora i byte in piu'.
+    void serializeResidual(std::ostream& out) const;
+    void deserializeResidual(std::istream& in);
+
     void setLearningRate(float value) { options_.learningRate = value; }
     [[nodiscard]] float learningRate() const { return options_.learningRate; }
 

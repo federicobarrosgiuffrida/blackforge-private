@@ -5,6 +5,8 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
+#include <cstring>
+#include <random>
 #include <istream>
 #include <ostream>
 #include <stdexcept>
@@ -870,6 +872,78 @@ void LowRankProjectedOptimizer::serializeState(std::ostream& out) const {
         writeDeviceVector(out, state.secondMoment);
     }
     if (!out) throw std::runtime_error("CUDA optimizer state: write failed");
+}
+
+namespace {
+
+constexpr char kResiduoTag[8] = {'B', 'F', 'R', 'E', 'S', 'I', 'D', '1'};
+
+// Hash FNV-1a del nome: serve un seme riproducibile fra esecuzioni, e
+// std::hash non lo garantisce fra build diverse.
+std::uint64_t semeDaNome(const std::string& nome) {
+    std::uint64_t h = 1469598103934665603ULL;
+    for (unsigned char c : nome) {
+        h ^= c;
+        h *= 1099511628211ULL;
+    }
+    return h;
+}
+
+}  // namespace
+
+void LowRankProjectedOptimizer::serializeResidual(std::ostream& out) const {
+    out.write(kResiduoTag, sizeof(kResiduoTag));
+    writeScalar<std::uint32_t>(out, static_cast<std::uint32_t>(states_.size()));
+    for (const auto& [name, state] : states_) {
+        writeName(out, name);
+        writeDeviceVector(out, state.tritResidual);
+    }
+}
+
+void LowRankProjectedOptimizer::deserializeResidual(std::istream& in) {
+    // Il residuo assente NON va sostituito con zero.
+    //
+    // In regime stazionario il residuo e' L - round(L) per un peso latente che
+    // diffonde, quindi distribuito quasi uniformemente su (-0,5, +0,5).
+    // Azzerarlo mette tutta la popolazione nello stesso punto: da li' i pesi
+    // accumulano insieme e ribaltano in ondate invece che di continuo.
+    //
+    // Misurato sul riavvio del 2 settembre, che ripartiva da un checkpoint
+    // senza residuo: ribaltamenti al 2-3 % contro lo 0,10 % di regime, con un
+    // picco 283 passi dopo la ripresa - esattamente i circa 217 passi che
+    // servono ad accumulare 0,5 con aggiornamenti da 0,0023 - e la loss salita
+    // di 0,18, non ancora rientrata dopo 3000 passi.
+    //
+    // L'inizializzazione uniforme lascia i trit IDENTICI, perche'
+    // l'arrotondamento non cambia, ma restituisce la distribuzione
+    // stazionaria. Il modello e' lo stesso, la popolazione e' desincronizzata.
+    const std::streampos inizio = in.tellg();
+    char tag[sizeof(kResiduoTag)]{};
+    in.read(tag, sizeof(tag));
+    const bool presente = in.good() && std::memcmp(tag, kResiduoTag, sizeof(tag)) == 0;
+    if (!presente) {
+        in.clear();
+        if (inizio != std::streampos(-1)) in.seekg(inizio);
+        for (auto& [name, state] : states_) {
+            if (state.tritResidual.bytes() == 0) continue;
+            const std::size_t count = state.tritResidual.bytes() / sizeof(float);
+            std::vector<float> host(count);
+            std::mt19937_64 rng(semeDaNome(name) ^ static_cast<std::uint64_t>(step_));
+            std::uniform_real_distribution<float> uniforme(-0.5F, 0.5F);
+            for (float& v : host) v = uniforme(rng);
+            BLACKFORGE_CUDA_CHECK(cudaMemcpy(state.tritResidual.data(), host.data(),
+                                             state.tritResidual.bytes(), cudaMemcpyHostToDevice));
+        }
+        return;
+    }
+    const std::size_t count = readScalar<std::uint32_t>(in);
+    if (count != states_.size()) throw std::runtime_error("CUDA optimizer residual: conteggio non corrispondente");
+    for (std::size_t i = 0; i < count; ++i) {
+        const std::string name = readName(in);
+        auto found = states_.find(name);
+        if (found == states_.end()) throw std::runtime_error("CUDA optimizer residual: parametro sconosciuto '" + name + "'");
+        readDeviceVector(in, found->second.tritResidual);
+    }
 }
 
 void LowRankProjectedOptimizer::deserializeState(std::istream& in) {

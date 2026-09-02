@@ -102,7 +102,10 @@ void saveCheckpoint(const std::string& path, BlackBitModel& model,
         out.write(reinterpret_cast<const char*>(host.data().data()),
                   static_cast<std::streamsize>(host.elementCount() * sizeof(float)));
     }
-    if (optimizer != nullptr) optimizer->serializeState(out);
+    if (optimizer != nullptr) {
+        optimizer->serializeState(out);
+        optimizer->serializeResidual(out);
+    }
     if (!out) throw std::runtime_error("CUDA BlackBit checkpoint: write failed for '" + path + "'");
 }
 
@@ -159,6 +162,7 @@ BlackBitTrainingState loadCheckpoint(const std::string& path, BlackBitModel& mod
     }
     if (hasOptimizer && optimizer != nullptr) {
         optimizer->deserializeState(in);
+        optimizer->deserializeResidual(in);
     } else if (!hasOptimizer && optimizer != nullptr) {
         throw std::runtime_error("CUDA BlackBit checkpoint: optimizer state requested but absent");
     }
