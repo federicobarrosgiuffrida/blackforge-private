@@ -214,6 +214,24 @@ TrainingResult train(const BlackBitConfig& config, const TrainingOptions& option
             currentEpoch = epoch;
             // Reload restores canonical order before applying this epoch's
             // deterministic permutation, making mid-run and resumed order identical.
+            // Libera lo shard corrente PRIMA di caricare il successivo.
+            //
+            // L'assegnazione diretta costruisce la seconda copia mentre la prima
+            // e' ancora viva: loadDataset alloca inputs e targets interi, li
+            // riempie, e solo alla fine il risultato viene spostato dentro
+            // 'dataset', distruggendo la vecchia. Il picco e' quindi due copie.
+            //
+            // Su questo shard una copia e' 1.056.143 x 1024 x 4 byte x 2 vettori
+            // = 8,65 GB, quindi il picco e' 17,3 GB contro 18,8 GB liberi sulla
+            // macchina: un margine dell'8 %, e un fallimento qui sarebbe fra i
+            // peggiori possibili, perche' e' DETERMINISTICO. Ripartire dal
+            // checkpoint riporta al confine di epoca, che rifallisce, in un
+            // ciclo che lascia la macchina ferma finche' qualcuno non guarda.
+            //
+            // Svuotare prima dimezza il picco a una copia sola. Costa una
+            // rilettura da disco che stiamo gia' facendo comunque.
+            dataset = data::Dataset(std::vector<std::size_t>{}, std::vector<std::size_t>{},
+                                    std::vector<float>{}, std::vector<float>{}, 0);
             dataset = data::loadDataset(options.datasetPath);
             dataset.shuffle(static_cast<unsigned int>(state.rngSeed + currentEpoch));
         }
@@ -241,9 +259,25 @@ TrainingResult train(const BlackBitConfig& config, const TrainingOptions& option
         const DeviceMemorySnapshot memory = telemetry.snapshot();
         memorySum += memory.usedBytes;
         if (progress != nullptr) {
+            // Le statistiche dell'ottimizzatore erano raccolte a ogni passo e
+            // stampate soltanto nel rapporto finale. Durante un run lungo non
+            // se ne vedeva una, e davanti a una loss ferma non c'era modo di
+            // distinguere fra le cause possibili: aggiornamenti troppo
+            // piccoli per far scattare i trit, trit saturati che non possono
+            // piu' muoversi, gradiente collassato, o rapporto
+            // aggiornamento/peso troppo basso. Sono quattro ipotesi diverse
+            // con quattro rimedi diversi, e i numeri per separarle erano gia'
+            // in memoria.
+            const auto& st = optimizer.stats().lastStep;
             *progress << "  text step " << state.step << ": loss " << step.loss << ", "
                       << (1000.0 * options.microBatch * seq / milliseconds) << " token/s, peak "
-                      << gib(memory.devicePeakUsedBytes) << "\n";
+                      << gib(memory.devicePeakUsedBytes)
+                      << ", flip " << st.flips
+                      << " (" << std::setprecision(4) << (st.flipFraction() * 100.0) << "%)"
+                      << ", sat " << st.saturatedTrits
+                      << ", gradRms " << st.gradientRms
+                      << ", updRms " << st.updateRms
+                      << ", optNorm " << st.optimizerNorm << "\n";
         }
         if (result.nanInfCount != 0) throw std::runtime_error("CUDA BlackBit trainer: numerical instability");
         if (options.checkpointEvery != 0 && !options.saveCheckpoint.empty() &&
