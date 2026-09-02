@@ -319,7 +319,8 @@ constexpr std::size_t kComponentTile = 32;
 // dipendono da (riga, colonna) e non dalla forma della griglia. Cambia
 // solo il raggruppamento di updateSquared, che alimenta il solo
 // updateRms diagnostico.
-__global__ void updatePackedKernel(std::uint32_t* packed, float* residual, float latentClamp, std::size_t rows, std::size_t cols,
+__global__ void updatePackedKernel(std::uint32_t* packed, float* residual, float latentClamp,
+                                   float latentDecay, std::size_t rows, std::size_t cols,
                                    std::size_t wordsPerRow, const float* direction, std::size_t rank,
                                    float learningRate, std::uint64_t seed, std::uint64_t epoch,
                                    std::uint64_t step, DeviceStepStats* stats) {
@@ -421,7 +422,13 @@ __global__ void updatePackedKernel(std::uint32_t* packed, float* residual, float
             // Col limite il residuo resta per costruzione in [-0,5, +0,5],
             // che e' anche cio' che ne rende possibile la memorizzazione a
             // pochi bit.
-            const float latent = fminf(fmaxf(static_cast<float>(oldTrit) + residual[flat] + update, -latentClamp), latentClamp);
+            // Il decadimento agisce sul peso latente PRIMA dell'aggiornamento,
+            // come un weight decay disaccoppiato: tira indietro dal bordo i pesi
+            // che vi si accumulano, senza interferire con la direzione del
+            // gradiente.
+            const float precedente = static_cast<float>(oldTrit) + residual[flat];
+            const float decaduto = precedente * (1.0F - latentDecay);
+            const float latent = fminf(fmaxf(decaduto + update, -latentClamp), latentClamp);
             target = latent;
             const float rounded = rintf(latent);
             newTrit = rounded < -1.0F ? -1 : (rounded > 1.0F ? 1 : static_cast<int>(rounded));
@@ -430,7 +437,15 @@ __global__ void updatePackedKernel(std::uint32_t* packed, float* residual, float
         trits[slot] = newTrit;
         ++elements;
         updateSquared += static_cast<double>(update) * static_cast<double>(update);
-        if (target <= -1.0F || target >= 1.0F) ++saturated;
+        // Saturazione misurata contro il limite vero, non contro 1. Il
+        // criterio originale precede il clamp: allora il latente valeva
+        // trit + aggiornamento e superare 1 significava saturare davvero.
+        // Con un limite a 2, |latente| >= 1 conta anche i pesi semplicemente
+        // decisi, che sono convergenza e non patologia. Quello che serve
+        // sapere e' quanti pesi sono incollati al bordo, dove non rispondono
+        // piu' al gradiente.
+        const float bordo = residual == nullptr ? 1.0F : latentClamp * 0.999F;
+        if (target <= -bordo || target >= bordo) ++saturated;
         if (newTrit != oldTrit) {
             ++flips;
             if (newTrit > oldTrit) {
@@ -676,7 +691,7 @@ void LowRankProjectedOptimizer::endStep() {
         updatePackedKernel<<<updateGrid, kBlockSize>>>(
             state.weight->packedWords(),
             state.tritResidual.bytes() == 0 ? nullptr : state.tritResidual.as<float>(), options_.latentClamp,
-            state.rows,
+            options_.latentDecay, state.rows,
             state.cols, state.weight->wordsPerRow(),
             state.accumulator.as<float>(), state.rank, options_.learningRate, state.seed, state.projectionEpoch,
             step_, deviceStats_.as<DeviceStepStats>());

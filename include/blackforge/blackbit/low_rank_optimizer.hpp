@@ -102,6 +102,13 @@ struct LowRankOptimizerOptions {
     // memorizzabile a pochi bit.
     float latentClamp = 1.0F;
 
+    // Decadimento applicato al peso latente a ogni passo, quando
+    // errorFeedback e' attivo. Impedisce ai pesi di accumularsi al bordo del
+    // limite, dove smetterebbero di rispondere al gradiente. Il commento sul
+    // weightDecay qui sotto - che il decadimento non ha senso su un peso
+    // ternario - valeva finche' non esisteva un peso latente da decadere.
+    float latentDecay = 0.0F;
+
     // Rango di default del sottospazio. Configurabile per parametro con
     // setRankFor().
     std::size_t rank = 32;
