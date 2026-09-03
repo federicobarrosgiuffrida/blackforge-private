@@ -721,6 +721,36 @@ void LowRankProjectedOptimizer::consumeDenseGradient(const ParameterId& id, cons
 }
 
 void LowRankProjectedOptimizer::endStep() {
+    // Correzione di bias di Adam: servono DUE valori, non uno.
+    //
+    // I momenti della proiezione vengono azzerati a ogni riseminatura, ogni
+    // projectionInterval passi, perche' si riferiscono a una base diversa. Ma
+    // la correzione continuava a usare il passo globale, cioe' assumeva che
+    // contenessero l'accumulo di centomila passi quando ne contenevano al
+    // massimo duecento.
+    //
+    // L'effetto non era un transitorio ma il regime stazionario:
+    //
+    //     distorsione = (1 - beta1^k) / sqrt(1 - beta2^k)
+    //
+    // con k passi dalla riseminatura. Su un ciclo di 200 passi vale in media
+    // 3,68 volte, oscillando fra 2,35 e 6,57: il learning rate efficace era
+    // quasi quattro volte quello nominale e ballava di tre volte dentro ogni
+    // ciclo, una dente di sega che nessuno aveva chiesto e che non torna mai
+    // a uno.
+    //
+    // Spiega anche perche' a learning rate 0,02 il modello restava piatto:
+    // 0,02 x 3,68 fa 0,074 efficaci, che e' territorio di divergenza.
+    //
+    // Le scale e i tensori densi NON vengono azzerati alla riseminatura - i
+    // loro momenti accumulano dall'inizio - quindi per loro la correzione
+    // globale resta quella giusta.
+    const std::size_t passiDaRiseminatura =
+        options_.projectionInterval == 0 ? step_ + 1 : (step_ % options_.projectionInterval) + 1;
+    const float biasProiezione1 =
+        1.0F - std::pow(options_.beta1, static_cast<float>(passiDaRiseminatura));
+    const float biasProiezione2 =
+        1.0F - std::pow(options_.beta2, static_cast<float>(passiDaRiseminatura));
     const float bias1 = 1.0F - std::pow(options_.beta1, static_cast<float>(step_ + 1));
     const float bias2 = 1.0F - std::pow(options_.beta2, static_cast<float>(step_ + 1));
     for (auto& [name, state] : states_) {
@@ -729,8 +759,8 @@ void LowRankProjectedOptimizer::endStep() {
         const std::size_t projectedValues = state.rank * state.cols;
         adamDirectionKernel<<<gridFor(projectedValues), kBlockSize>>>(
             state.firstMoment.as<float>(), state.secondMoment.as<float>(), state.accumulator.as<float>(),
-            projectedValues, options_.beta1, options_.beta2, bias1, bias2, options_.eps,
-            deviceStats_.as<DeviceStepStats>());
+            projectedValues, options_.beta1, options_.beta2, biasProiezione1, biasProiezione2,
+            options_.eps, deviceStats_.as<DeviceStepStats>());
         // (colonna di word, blocco di righe): vedi il commento su
         // updatePackedKernel per il perche' della mappatura.
         const dim3 updateGrid(static_cast<unsigned int>(state.weight->wordsPerRow()),
