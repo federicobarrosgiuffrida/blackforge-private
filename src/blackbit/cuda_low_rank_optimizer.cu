@@ -44,6 +44,48 @@ unsigned int gridFor(std::size_t count) {
     return static_cast<unsigned int>((count + kBlockSize - 1) / kBlockSize);
 }
 
+// Residuo a un byte invece che a quattro.
+//
+// PERCHE' UN BYTE E NON MEZZO. Il residuo esiste per accumulare aggiornamenti
+// troppo piccoli per ribaltare un trit, e servono circa 217 passi da 0,0023
+// per accumulare i 0,5 che lo ribaltano. L'arrotondamento stocastico e' non
+// distorto ma aggiunge a ogni passo un rumore di deviazione standard passo/2,
+// che si somma come una passeggiata aleatoria: dopo n passi vale
+// (passo/2)*sqrt(n). Perche' il segnale domini il rumore di un fattore tre
+// sui 217 passi che servono a decidere un trit:
+//
+//     (passo/2) * sqrt(217) * 3  <  0,5   =>   passo < 0,023
+//
+// Su un intervallo [-1, +1] servono quindi almeno 88 livelli, cioe' 7 bit. A
+// 4 bit il passo sarebbe 0,133 e il rumore accumulato 0,99 contro un segnale
+// di 0,5: la retroazione dell'errore smetterebbe di funzionare, e con essa
+// l'unico meccanismo che rende addestrabile un peso ternario. Un byte da
+// passo 1/127 = 0,0079, con un margine di otto volte.
+//
+// L'intervallo e' [-1, +1] per costruzione: il residuo e' latent - trit, il
+// latente e' limitato a C = 2 e il trit e' saturato a 1, quindi |residuo| <= C-1.
+constexpr float kResiduoPasso = 1.0F / 127.0F;
+constexpr int kResiduoZero = 127;
+
+__device__ inline float dequantizzaResiduo(unsigned char q) {
+    return static_cast<float>(static_cast<int>(q) - kResiduoZero) * kResiduoPasso;
+}
+
+__device__ inline unsigned char quantizzaResiduo(float r, std::uint64_t seed, std::uint64_t contatore) {
+    const float x = fminf(fmaxf(r, -1.0F), 1.0F) / kResiduoPasso + static_cast<float>(kResiduoZero);
+    const float basso = floorf(x);
+    const float frazione = x - basso;
+    // Arrotondamento STOCASTICO e non al piu' vicino: e' cio' che rende la
+    // quantizzazione non distorta, E[q] = r. Con l'arrotondamento al piu'
+    // vicino un aggiornamento da 0,0023 su un passo da 0,0079 verrebbe
+    // scartato SEMPRE, e la retroazione dell'errore - che esiste proprio per
+    // non perdere gli aggiornamenti piccoli - diventerebbe inutile.
+    const std::uint64_t mescolato = counterRandom(seed, contatore);
+    const float u = static_cast<float>(mescolato >> 40) * (1.0F / 16777216.0F);
+    const float scelto = basso + (u < frazione ? 1.0F : 0.0F);
+    return static_cast<unsigned char>(fminf(fmaxf(scelto, 0.0F), 255.0F));
+}
+
 __device__ float projection(std::uint64_t seed, std::uint64_t epoch, std::size_t row, std::size_t component,
                             std::size_t rank) {
     const std::uint64_t mixed = counterRandom(seed ^ (epoch * 0x9E3779B97F4A7C15ULL),
@@ -321,7 +363,7 @@ constexpr std::size_t kComponentTile = 32;
 // dipendono da (riga, colonna) e non dalla forma della griglia. Cambia
 // solo il raggruppamento di updateSquared, che alimenta il solo
 // updateRms diagnostico.
-__global__ void updatePackedKernel(std::uint32_t* packed, float* residual, float latentClamp,
+__global__ void updatePackedKernel(std::uint32_t* packed, unsigned char* residual, float latentClamp,
                                    float latentDecay, std::size_t rows, std::size_t cols,
                                    std::size_t wordsPerRow, const float* direction, std::size_t rank,
                                    float learningRate, std::uint64_t seed, std::uint64_t epoch,
@@ -428,13 +470,14 @@ __global__ void updatePackedKernel(std::uint32_t* packed, float* residual, float
             // come un weight decay disaccoppiato: tira indietro dal bordo i pesi
             // che vi si accumulano, senza interferire con la direzione del
             // gradiente.
-            const float precedente = static_cast<float>(oldTrit) + residual[flat];
+            const float precedente = static_cast<float>(oldTrit) + dequantizzaResiduo(residual[flat]);
             const float decaduto = precedente * (1.0F - latentDecay);
             const float latent = fminf(fmaxf(decaduto + update, -latentClamp), latentClamp);
             target = latent;
             const float rounded = rintf(latent);
             newTrit = rounded < -1.0F ? -1 : (rounded > 1.0F ? 1 : static_cast<int>(rounded));
-            residual[flat] = latent - static_cast<float>(newTrit);
+            residual[flat] = quantizzaResiduo(latent - static_cast<float>(newTrit), seed,
+                                              step * 0x9E3779B97F4A7C15ULL + flat);
         }
         trits[slot] = newTrit;
         ++elements;
@@ -548,9 +591,11 @@ void LowRankProjectedOptimizer::allocateState(const std::string& name, State& st
     BLACKFORGE_CUDA_CHECK(cudaMemset(state.secondMoment.data(), 0, bytes));
     BLACKFORGE_CUDA_CHECK(cudaMemset(state.accumulator.data(), 0, bytes));
     if (options_.errorFeedback) {
-        const std::size_t residualBytes = state.rows * state.cols * sizeof(float);
+        // Un byte per peso, non quattro: vedi la nota su kResiduoPasso.
+        // Il valore neutro non e' 0 ma il codice centrale, che decodifica a 0.
+        const std::size_t residualBytes = state.rows * state.cols * sizeof(unsigned char);
         state.tritResidual = Buffer(residualBytes, MemoryArena::Optimizer);
-        BLACKFORGE_CUDA_CHECK(cudaMemset(state.tritResidual.data(), 0, residualBytes));
+        BLACKFORGE_CUDA_CHECK(cudaMemset(state.tritResidual.data(), kResiduoZero, residualBytes));
     }
 
     state.scaleCount = state.rows * weight.groupsPerRow();
@@ -692,7 +737,8 @@ void LowRankProjectedOptimizer::endStep() {
                               gridFor(state.rows));
         updatePackedKernel<<<updateGrid, kBlockSize>>>(
             state.weight->packedWords(),
-            state.tritResidual.bytes() == 0 ? nullptr : state.tritResidual.as<float>(), options_.latentClamp,
+            state.tritResidual.bytes() == 0 ? nullptr : state.tritResidual.as<unsigned char>(),
+            options_.latentClamp,
             options_.latentDecay, state.rows,
             state.cols, state.weight->wordsPerRow(),
             state.accumulator.as<float>(), state.rank, options_.learningRate, state.seed, state.projectionEpoch,
@@ -876,7 +922,7 @@ void LowRankProjectedOptimizer::serializeState(std::ostream& out) const {
 
 namespace {
 
-constexpr char kResiduoTag[8] = {'B', 'F', 'R', 'E', 'S', 'I', 'D', '1'};
+constexpr char kResiduoTag[8] = {'B', 'F', 'R', 'E', 'S', 'I', 'D', '2'};
 
 // Hash FNV-1a del nome: serve un seme riproducibile fra esecuzioni, e
 // std::hash non lo garantisce fra build diverse.
@@ -896,7 +942,15 @@ void LowRankProjectedOptimizer::serializeResidual(std::ostream& out) const {
     writeScalar<std::uint32_t>(out, static_cast<std::uint32_t>(states_.size()));
     for (const auto& [name, state] : states_) {
         writeName(out, name);
-        writeDeviceVector(out, state.tritResidual);
+        // Byte e non float: writeDeviceVector divide per sizeof(float) e
+        // sbaglierebbe il conteggio di quattro volte.
+        writeScalar<std::uint64_t>(out, static_cast<std::uint64_t>(state.tritResidual.bytes()));
+        if (state.tritResidual.bytes() == 0) continue;
+        std::vector<unsigned char> host(state.tritResidual.bytes());
+        BLACKFORGE_CUDA_CHECK(cudaMemcpy(host.data(), state.tritResidual.data(),
+                                         state.tritResidual.bytes(), cudaMemcpyDeviceToHost));
+        out.write(reinterpret_cast<const char*>(host.data()),
+                  static_cast<std::streamsize>(host.size()));
     }
 }
 
@@ -926,11 +980,10 @@ void LowRankProjectedOptimizer::deserializeResidual(std::istream& in) {
         if (inizio != std::streampos(-1)) in.seekg(inizio);
         for (auto& [name, state] : states_) {
             if (state.tritResidual.bytes() == 0) continue;
-            const std::size_t count = state.tritResidual.bytes() / sizeof(float);
-            std::vector<float> host(count);
+            std::vector<unsigned char> host(state.tritResidual.bytes());
             std::mt19937_64 rng(semeDaNome(name) ^ static_cast<std::uint64_t>(step_));
-            std::uniform_real_distribution<float> uniforme(-0.5F, 0.5F);
-            for (float& v : host) v = uniforme(rng);
+            std::uniform_int_distribution<int> uniforme(kResiduoZero - 63, kResiduoZero + 63);
+            for (unsigned char& v : host) v = static_cast<unsigned char>(uniforme(rng));
             BLACKFORGE_CUDA_CHECK(cudaMemcpy(state.tritResidual.data(), host.data(),
                                              state.tritResidual.bytes(), cudaMemcpyHostToDevice));
         }
@@ -942,7 +995,14 @@ void LowRankProjectedOptimizer::deserializeResidual(std::istream& in) {
         const std::string name = readName(in);
         auto found = states_.find(name);
         if (found == states_.end()) throw std::runtime_error("CUDA optimizer residual: parametro sconosciuto '" + name + "'");
-        readDeviceVector(in, found->second.tritResidual);
+        Buffer& buf = found->second.tritResidual;
+        const std::size_t bytes = static_cast<std::size_t>(readScalar<std::uint64_t>(in));
+        if (bytes != buf.bytes()) throw std::runtime_error("CUDA optimizer residual: dimensione non corrispondente per '" + name + "'");
+        if (bytes == 0) continue;
+        std::vector<unsigned char> host(bytes);
+        in.read(reinterpret_cast<char*>(host.data()), static_cast<std::streamsize>(bytes));
+        if (!in) throw std::runtime_error("CUDA optimizer residual: file troncato");
+        BLACKFORGE_CUDA_CHECK(cudaMemcpy(buf.data(), host.data(), bytes, cudaMemcpyHostToDevice));
     }
 }
 
