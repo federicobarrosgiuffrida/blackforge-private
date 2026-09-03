@@ -65,6 +65,12 @@ void printUsage() {
               << "  blackbit-generate  Genera testo da un checkpoint BlackBit (richiede --from-checkpoint e\n"
               << "                     --tokenizer; opzionali --prompt, --max-new-tokens, --temperature).\n"
               << "                     Temperatura 0 sceglie sempre il token piu' probabile\n"
+              << "  --top-p F          Nucleus sampling: tiene il minimo insieme di token la cui massa cumulata\n"
+              << "                     raggiunge F, scartando la coda (default 0.9; 1 disattiva)\n"
+              << "  --top-k N          Tiene solo gli N token piu probabili (default 0 = disattivo)\n"
+              << "  --repetition-penalty F  Allontana dai token gia generati nella finestra recente. Serve anche a\n"
+              << "                     temperatura 0, dove la decodifica greedy nuda cade in cicli (default 1.1)\n"
+              << "  --penalty-window N Quanti token recenti considera la penalita (default 64; 0 = tutti)\n"
               << "  blackbit-eval      Valuta un checkpoint su dati mai visti e riporta loss, perplexity e bit\n"
               << "                     per byte (richiede --from-checkpoint, --dataset e --device cuda;\n"
               << "                     --bytes-per-token abilita i bit per byte, --max-examples limita)\n"
@@ -1005,7 +1011,8 @@ int runBlackBitEval(const std::string& checkpointPath, const std::string& datase
 
 int runBlackBitGenerate(const std::string& checkpointPath, const std::string& tokenizerPath,
                          const std::string& prompt, std::size_t maxNewTokens, float temperature,
-                         unsigned int seed) {
+                         float topP, std::size_t topK, float repetitionPenalty,
+                         std::size_t penaltyWindow, unsigned int seed) {
     try {
         const blackforge::blackbit::BlackBitConfig config =
             blackforge::blackbit::readCheckpointConfig(checkpointPath);
@@ -1016,6 +1023,9 @@ int runBlackBitGenerate(const std::string& checkpointPath, const std::string& to
 
         std::cerr << "checkpoint al passo " << state.step << ", " << state.tokensSeen
                    << " token visti\n";
+        std::cerr << "campionamento: temperatura " << temperature << ", top-p " << topP
+                   << ", top-k " << topK << ", penalita ripetizione " << repetitionPenalty
+                   << " su finestra " << penaltyWindow << "\n";
 
         const std::vector<std::uint32_t> encoded = tok.encode(prompt);
         std::vector<int> tokens;
@@ -1037,27 +1047,77 @@ int runBlackBitGenerate(const std::string& checkpointPath, const std::string& to
             const std::size_t vocab = config.vocabSize;
             const float* riga = logits.data().data() + (seq - 1) * vocab;
 
+            // Penalita' di ripetizione sui logit grezzi, prima di tutto il resto.
+            //
+            // I cicli di ripetizione non sono un sintomo di sottoaddestramento:
+            // anche modelli grandi e completi degenerano se campionati
+            // massimizzando la verosimiglianza senza correttivi. Serve quindi
+            // anche - e soprattutto - a temperatura 0, dove la decodifica greedy
+            // nuda cade in "......" dopo pochi token.
+            //
+            // Forma di Keskar e colleghi: si divide il logit positivo e si
+            // moltiplica quello negativo, cosi' la penalita' allontana sempre
+            // dal token gia' visto qualunque sia il segno.
+            std::vector<float> logit(riga, riga + vocab);
+            if (repetitionPenalty > 1.0F && !tokens.empty()) {
+                const std::size_t quanti = penaltyWindow == 0 ? tokens.size()
+                                                              : std::min(penaltyWindow, tokens.size());
+                for (std::size_t k = tokens.size() - quanti; k < tokens.size(); ++k) {
+                    const std::size_t id = static_cast<std::size_t>(tokens[k]);
+                    if (id >= vocab) continue;
+                    logit[id] = logit[id] > 0.0F ? logit[id] / repetitionPenalty
+                                                 : logit[id] * repetitionPenalty;
+                }
+            }
+
             int scelto = 0;
             if (temperature <= 0.0F) {
-                float migliore = riga[0];
+                float migliore = logit[0];
                 for (std::size_t v = 1; v < vocab; ++v) {
-                    if (riga[v] > migliore) { migliore = riga[v]; scelto = static_cast<int>(v); }
+                    if (logit[v] > migliore) { migliore = logit[v]; scelto = static_cast<int>(v); }
                 }
             } else {
                 // softmax con temperatura, stabilizzato sottraendo il massimo
-                float massimo = riga[0];
-                for (std::size_t v = 1; v < vocab; ++v) massimo = std::max(massimo, riga[v]);
-                double somma = 0.0;
+                float massimo = logit[0];
+                for (std::size_t v = 1; v < vocab; ++v) massimo = std::max(massimo, logit[v]);
                 std::vector<double> pesi(vocab);
+                double somma = 0.0;
                 for (std::size_t v = 0; v < vocab; ++v) {
-                    pesi[v] = std::exp(static_cast<double>((riga[v] - massimo) / temperature));
+                    pesi[v] = std::exp(static_cast<double>((logit[v] - massimo) / temperature));
                     somma += pesi[v];
                 }
-                std::uniform_real_distribution<double> uniforme(0.0, somma);
+
+                // Ordino per probabilita' decrescente per poter tagliare la coda.
+                std::vector<std::size_t> ordine(vocab);
+                for (std::size_t v = 0; v < vocab; ++v) ordine[v] = v;
+                std::sort(ordine.begin(), ordine.end(),
+                          [&pesi](std::size_t a, std::size_t b) { return pesi[a] > pesi[b]; });
+
+                // top-k: si tengono i k piu' probabili.
+                std::size_t tenuti = topK == 0 ? vocab : std::min(topK, vocab);
+
+                // top-p (nucleus): si tiene il minimo insieme la cui massa
+                // cumulata raggiunge p. Taglia la coda lunga di token quasi
+                // impossibili che, sommati su un vocabolario da migliaia di
+                // voci, vengono estratti abbastanza spesso da rovinare il testo.
+                if (topP > 0.0F && topP < 1.0F) {
+                    double cumulata = 0.0;
+                    std::size_t nucleo = 0;
+                    for (; nucleo < tenuti; ++nucleo) {
+                        cumulata += pesi[ordine[nucleo]] / somma;
+                        if (cumulata >= static_cast<double>(topP)) { ++nucleo; break; }
+                    }
+                    tenuti = std::max<std::size_t>(1, std::min(tenuti, nucleo));
+                }
+
+                double massa = 0.0;
+                for (std::size_t i = 0; i < tenuti; ++i) massa += pesi[ordine[i]];
+                std::uniform_real_distribution<double> uniforme(0.0, massa);
                 double soglia = uniforme(rng);
-                for (std::size_t v = 0; v < vocab; ++v) {
-                    soglia -= pesi[v];
-                    if (soglia <= 0.0) { scelto = static_cast<int>(v); break; }
+                scelto = static_cast<int>(ordine[tenuti - 1]);
+                for (std::size_t i = 0; i < tenuti; ++i) {
+                    soglia -= pesi[ordine[i]];
+                    if (soglia <= 0.0) { scelto = static_cast<int>(ordine[i]); break; }
                 }
             }
             tokens.push_back(scelto);
@@ -1389,6 +1449,10 @@ int main(int argc, char** argv) {
     float latentClamp = 0.0F;
     float latentDecay = 0.0F;
     double bytesPerToken = 0.0;
+    float topP = 0.9F;
+    std::size_t topK = 0;
+    float repetitionPenalty = 1.1F;
+    std::size_t penaltyWindow = 64;
     std::size_t maxExamples = 0;
     float temperature = 0.0F;
     std::string recomputeMode;
@@ -1530,6 +1594,30 @@ int main(int argc, char** argv) {
                 return 2;
             }
             temperature = std::strtof(args[++i].c_str(), nullptr);
+        } else if (args[i] == "--top-p") {
+            if (i + 1 >= args.size()) {
+                std::cerr << "errore: '--top-p' richiede un valore\n";
+                return 2;
+            }
+            topP = std::strtof(args[++i].c_str(), nullptr);
+        } else if (args[i] == "--top-k") {
+            if (i + 1 >= args.size()) {
+                std::cerr << "errore: '--top-k' richiede un valore\n";
+                return 2;
+            }
+            topK = static_cast<std::size_t>(std::strtoull(args[++i].c_str(), nullptr, 10));
+        } else if (args[i] == "--repetition-penalty") {
+            if (i + 1 >= args.size()) {
+                std::cerr << "errore: '--repetition-penalty' richiede un valore\n";
+                return 2;
+            }
+            repetitionPenalty = std::strtof(args[++i].c_str(), nullptr);
+        } else if (args[i] == "--penalty-window") {
+            if (i + 1 >= args.size()) {
+                std::cerr << "errore: '--penalty-window' richiede un valore\n";
+                return 2;
+            }
+            penaltyWindow = static_cast<std::size_t>(std::strtoull(args[++i].c_str(), nullptr, 10));
         } else if (args[i] == "--bytes-per-token") {
             if (i + 1 >= args.size()) {
                 std::cerr << "errore: '--bytes-per-token' richiede un valore\n";
@@ -1706,7 +1794,8 @@ int main(int argc, char** argv) {
             return 2;
         }
         return runBlackBitGenerate(fromCheckpoint, tokenizerPath, prompt,
-                                    maxNewTokens == 0 ? 50 : maxNewTokens, temperature, 42U);
+                                    maxNewTokens == 0 ? 50 : maxNewTokens, temperature, topP, topK,
+                                    repetitionPenalty, penaltyWindow, 42U);
     }
 
     if (command == "tokenizer-train") {
