@@ -1,5 +1,9 @@
 # BlackForge
 
+**BlackBit** — A C++/CUDA training engine for ternary language models. Ran 100 training steps and resumed from a checkpoint on a 9.05B-parameter MoE using a single 8 GB RTX 5060, with 4.38 GiB peak VRAM.
+
+[100-step training loss log](docs/phase9_9b_100step_loss.csv) · [Run and checkpoint notes](docs/blackbit.md#75-smoke-9b-su-testo-reale-e-resume)
+
 [![Release](https://img.shields.io/github/v/release/federicobarrosgiuffrida/blackforge)](https://github.com/federicobarrosgiuffrida/blackforge/releases/latest)
 
 BlackForge è un linguaggio di programmazione **verticale**, dedicato
